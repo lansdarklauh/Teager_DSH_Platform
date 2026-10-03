@@ -1,0 +1,36 @@
+# .NET
+**/bin/
+**/obj/
+*.user
+*.suo
+.vs/
+TestResults/
+
+# Node / Vite
+node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+frontend/vite.config.ts.timestamp-*
+
+# 运行期数据（工作空间文件 / 日志 / 缓存，不进仓库）
+/.data/
+/.logs/
+/.cache/
+
+# 环境变量与密钥
+.env
+.env.*
+!.env.example
+!deploy/.env.example
+*.pfx
+*.key
+
+# Python
+__pycache__/
+*.pyc
+sdk/python/dist/
+sdk/python/*.egg-info/
+
+# IDE
+.idea/
+.cursor/

@@ -1,0 +1,100 @@
+# DSH 平台一体化部署（API + Web，可选自带 SQL Server）。适合单机自建 / 联调 / 验收。
+# 用法（在 deploy 目录）：
+#   cp .env.example .env && 编辑 .env（至少改 DSH_MASTER_KEY / DSH_ADMIN_PASSWORD / MSSQL 密码）
+#   docker compose --profile with-db up -d --build      # 使用 compose 自带 SQL Server
+#   docker compose up -d --build                        # 使用外部 SQL Server（在 .env 里配置 DSH_SQL）
+# 通过 Teager_DevOps 分别部署前后端时，请改用 backend/docker-compose.yml 与 frontend/Dockerfile，详见 docs/deploy.md。
+
+name: dsh-platform
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "3"
+
+services:
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    profiles: ["with-db"]
+    container_name: ${DSH_MSSQL_CONTAINER:-dsh-mssql}
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?请设置 MSSQL_SA_PASSWORD（至少 8 位，含大小写字母、数字、符号）}
+      MSSQL_PID: ${MSSQL_PID:-Developer}
+      MSSQL_MEMORY_LIMIT_MB: ${MSSQL_MEMORY_LIMIT_MB:-2048}
+    volumes:
+      - ${DSH_MSSQL_DIR:-/var/lib/dsh/mssql}:/var/opt/mssql        # 数据库文件（需 uid 10001 可写：chown 10001 目录）
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -Q \"SELECT 1\" || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks: [dsh]
+
+  api:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
+        DSH_VERSION: ${DSH_VERSION:-latest}
+    image: ${DSH_API_IMAGE:-dsh-api:latest}
+    container_name: ${DSH_API_CONTAINER:-dsh-api}
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      mssql:
+        condition: service_healthy
+        required: false
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      TZ: ${TZ:-Asia/Shanghai}
+      ConnectionStrings__Default: ${DSH_SQL:-Server=mssql,1433;Database=DshPlatform;User ID=sa;Password=${MSSQL_SA_PASSWORD:-};TrustServerCertificate=True;MultipleActiveResultSets=true}
+      Dsh__Security__MasterKey: ${DSH_MASTER_KEY:?请设置 DSH_MASTER_KEY}
+      Dsh__Platform__CookieSecure: ${DSH_COOKIE_SECURE:-auto}
+      Dsh__Platform__PublicBaseUrl: ${DSH_PUBLIC_URL:-}
+      Dsh__Platform__MaxUploadMb: ${DSH_MAX_UPLOAD_MB:-200}
+      Dsh__Seed__AdminUsername: ${DSH_ADMIN_USERNAME:-admin}
+      Dsh__Seed__AdminPassword: ${DSH_ADMIN_PASSWORD:-}
+      Dsh__Seed__DemoData: ${DSH_DEMO_DATA:-false}
+      Dsh__Runtime__DefaultProvider: ${DSH_DEFAULT_PROVIDER:-DeepSeekHarness}
+      Dsh__Runtime__TerminalEnabled: ${DSH_TERMINAL_ENABLED:-false}
+      Dsh__Runtime__RunTimeoutMinutes: ${DSH_RUN_TIMEOUT_MINUTES:-30}
+      Dsh__Runtime__MaxConcurrentRunsPerPool: ${DSH_MAX_CONCURRENT_RUNS:-4}
+      Dsh__Runtime__ExtraEnv__DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      Dsh__Policy__SandboxMode: ${DSH_SANDBOX_MODE:-workspace-write}
+      Serilog__MinimumLevel__Default: ${DSH_LOG_LEVEL:-Information}
+    volumes:
+      - ${DSH_DATA_DIR:-/var/lib/dsh/data}:/app/data
+      - ${DSH_LOG_DIR:-/var/log/dsh}:/app/logs
+      - ${DSH_CACHE_DIR:-/var/cache/dsh}:/app/cache
+    networks: [dsh]
+
+  web:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
+    image: ${DSH_WEB_IMAGE:-dsh-web:latest}
+    container_name: ${DSH_WEB_CONTAINER:-dsh-web}
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on: [api]
+    environment:
+      API_UPSTREAM: http://api:5600
+      MAX_BODY_SIZE: ${DSH_MAX_BODY_SIZE:-512m}
+    ports:
+      - "${DSH_WEB_PORT:-5680}:5680"
+    volumes:
+      - ${DSH_NGINX_LOG_DIR:-/var/log/dsh/nginx}:/var/log/nginx
+      - ${DSH_NGINX_CACHE_DIR:-/var/cache/dsh/nginx}:/var/cache/nginx
+    networks: [dsh]
+
+networks:
+  dsh:
+    name: ${DSH_NETWORK:-dsh}

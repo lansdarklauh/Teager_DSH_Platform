@@ -1,0 +1,5 @@
+# 保证 shell 脚本与 nginx 模板在 Windows 检出后仍为 LF，避免容器内 "bad interpreter"
+*.sh text eol=lf
+*.template text eol=lf
+Dockerfile text eol=lf
+*.yml text eol=lf

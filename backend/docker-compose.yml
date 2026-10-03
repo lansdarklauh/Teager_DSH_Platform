@@ -1,0 +1,69 @@
+# DSH 平台后端（API）栈。
+# Teager_DevOps：部署策略选「多服务 Compose」（也可单服务），白名单填 backend/docker-compose.yml；
+# 镜像变量由平台写入 .env（TEAGER_IMAGE_api）。数据 / 日志 / 缓存默认绑到宿主机目录，避免占用 /var/lib/docker。
+# 所有变量都有默认值；生产至少要设置：DSH_SQL、DSH_MASTER_KEY、DSH_ADMIN_PASSWORD（首次建管理员）。
+
+name: dsh-backend
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "3"
+
+services:
+  api:
+    image: ${TEAGER_IMAGE_api:-dsh-api:local}
+    container_name: ${DSH_API_CONTAINER:-dsh-api}
+    restart: unless-stopped
+    logging: *default-logging
+    ports:
+      - "${DSH_API_PORT:-5600}:5600"
+    environment:
+      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT:-Production}
+      TZ: ${TZ:-Asia/Shanghai}
+      # ── 数据库（SQL Server，只存元数据 / 权限 / 会话索引 / 审计；大文件与运行事件日志不入库）──
+      ConnectionStrings__Default: ${DSH_SQL:-Server=host.docker.internal,1433;Database=DshPlatform;User ID=sa;Password=ChangeMe_123;TrustServerCertificate=True;MultipleActiveResultSets=true}
+      Dsh__Platform__AutoMigrate: ${DSH_AUTO_MIGRATE:-true}
+      # ── 目录（容器内固定，宿主机路径见下方 volumes）──
+      Dsh__Storage__DataDir: /app/data
+      Dsh__Storage__LogDir: /app/logs
+      Dsh__Storage__CacheDir: /app/cache
+      # ── 安全 ──
+      Dsh__Security__MasterKey: ${DSH_MASTER_KEY:?请设置 DSH_MASTER_KEY（用于加密存储 Secret，任意长随机字符串，丢失后已存密钥无法解密）}
+      Dsh__Platform__CookieSecure: ${DSH_COOKIE_SECURE:-auto}
+      Dsh__Platform__PublicBaseUrl: ${DSH_PUBLIC_URL:-}
+      Dsh__Platform__MaxUploadMb: ${DSH_MAX_UPLOAD_MB:-200}
+      Dsh__RateLimit__PermitPerMinute: ${DSH_RATE_LIMIT_PER_MINUTE:-1200}
+      Dsh__RateLimit__LoginPerMinute: ${DSH_LOGIN_PER_MINUTE:-10}
+      # ── 首个管理员（仅当库中没有管理员时创建；建好后可清空 DSH_ADMIN_PASSWORD）──
+      Dsh__Seed__AdminUsername: ${DSH_ADMIN_USERNAME:-admin}
+      Dsh__Seed__AdminPassword: ${DSH_ADMIN_PASSWORD:-}
+      Dsh__Seed__DemoData: ${DSH_DEMO_DATA:-false}
+      # ── Runtime ──
+      Dsh__Runtime__DefaultProvider: ${DSH_DEFAULT_PROVIDER:-DeepSeekHarness}
+      Dsh__Runtime__DshExecutable: dsh
+      Dsh__Runtime__TerminalEnabled: ${DSH_TERMINAL_ENABLED:-false}
+      Dsh__Runtime__RunTimeoutMinutes: ${DSH_RUN_TIMEOUT_MINUTES:-30}
+      Dsh__Runtime__MaxConcurrentRunsPerPool: ${DSH_MAX_CONCURRENT_RUNS:-4}
+      Dsh__Runtime__IdleMinutes: ${DSH_RUNTIME_IDLE_MINUTES:-5}
+      Dsh__Runtime__AutoStopMinutes: ${DSH_RUNTIME_AUTOSTOP_MINUTES:-60}
+      # 平台级默认模型密钥（可选，优先级最低；也可在 Web 的“平台配置 → 组织密钥 / Pool 密钥”里设置）
+      Dsh__Runtime__ExtraEnv__DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      # ── 平台默认策略（Pool 策略只能在此基础上收紧）──
+      Dsh__Policy__SandboxMode: ${DSH_SANDBOX_MODE:-workspace-write}
+      Dsh__Policy__MaxStorageMbPerWorkspace: ${DSH_MAX_WORKSPACE_MB:-5120}
+      Serilog__MinimumLevel__Default: ${DSH_LOG_LEVEL:-Information}
+    volumes:
+      # 三类目录相互独立，可分别放到不同磁盘（见 docs/deploy.md「换地方安置」）
+      - ${DSH_DATA_DIR:-/var/lib/dsh/data}:/app/data       # Workspace 文件 / 共享空间 / 各 Pool 的 DSH_HOME / 快照（必须持久化并备份）
+      - ${DSH_LOG_DIR:-/var/log/dsh}:/app/logs             # 应用日志（按天滚动）+ Agent 运行事件日志（JSONL）
+      - ${DSH_CACHE_DIR:-/var/cache/dsh}:/app/cache        # 上传 / 打包临时文件、dsh 的 HOME（可清空）
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - dsh
+
+networks:
+  dsh:
+    name: ${DSH_NETWORK:-dsh}

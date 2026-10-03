@@ -1,0 +1,47 @@
+/* 设计令牌：扁平化 + 多色模块 + 现代简洁。每个业务模块有一组主色 / 柔和底色 / 深色文字。 */
+:root {
+  --bg: #f5f6fa;
+  --surface: #ffffff;
+  --surface-2: #fafbfd;
+  --border: #e7e9f0;
+  --border-strong: #d5d9e4;
+  --text: #1f2433;
+  --text-2: #565d73;
+  --text-3: #8a91a6;
+  --radius: 14px;
+  --radius-sm: 10px;
+  --radius-xs: 7px;
+  --gap: 20px;
+  --shadow-hover: 0 6px 20px rgba(31, 36, 51, 0.07);
+
+  /* 模块色：Pool 靛蓝 / Workspace 青绿 / 共享空间 琥珀 / Runtime 紫 / 会话 蓝 / Token 青 / 审计 玫红 / 用量 粉 / 配置 天蓝 / 管理 石板 */
+  --pool: #4f46e5;       --pool-soft: #eef0ff;       --pool-ink: #3730a3;
+  --ws: #0d9488;         --ws-soft: #e6f7f5;         --ws-ink: #0f766e;
+  --space: #f08a00;      --space-soft: #fff4e0;      --space-ink: #b45309;
+  --runtime: #7c3aed;    --runtime-soft: #f3edff;    --runtime-ink: #5b21b6;
+  --chat: #2563eb;       --chat-soft: #e9f0ff;       --chat-ink: #1d4ed8;
+  --token: #0891b2;      --token-soft: #e3f6fa;      --token-ink: #0e7490;
+  --audit: #e11d48;      --audit-soft: #ffeaf0;      --audit-ink: #be123c;
+  --usage: #db2777;      --usage-soft: #fde8f3;      --usage-ink: #9d174d;
+  --config: #0284c7;     --config-soft: #e3f3fd;     --config-ink: #0369a1;
+  --admin: #475569;      --admin-soft: #eceff4;      --admin-ink: #334155;
+  --ok: #16a34a;         --ok-soft: #e7f7ed;
+  --warn: #d97706;       --warn-soft: #fff3dc;
+  --danger: #dc2626;     --danger-soft: #fdeaea;
+
+  /* 当前模块（由页面根节点的 data-mod 覆盖） */
+  --mod: var(--pool);
+  --mod-soft: var(--pool-soft);
+  --mod-ink: var(--pool-ink);
+}
+
+[data-mod='pool'] { --mod: var(--pool); --mod-soft: var(--pool-soft); --mod-ink: var(--pool-ink); }
+[data-mod='ws'] { --mod: var(--ws); --mod-soft: var(--ws-soft); --mod-ink: var(--ws-ink); }
+[data-mod='space'] { --mod: var(--space); --mod-soft: var(--space-soft); --mod-ink: var(--space-ink); }
+[data-mod='runtime'] { --mod: var(--runtime); --mod-soft: var(--runtime-soft); --mod-ink: var(--runtime-ink); }
+[data-mod='chat'] { --mod: var(--chat); --mod-soft: var(--chat-soft); --mod-ink: var(--chat-ink); }
+[data-mod='token'] { --mod: var(--token); --mod-soft: var(--token-soft); --mod-ink: var(--token-ink); }
+[data-mod='audit'] { --mod: var(--audit); --mod-soft: var(--audit-soft); --mod-ink: var(--audit-ink); }
+[data-mod='usage'] { --mod: var(--usage); --mod-soft: var(--usage-soft); --mod-ink: var(--usage-ink); }
+[data-mod='config'] { --mod: var(--config); --mod-soft: var(--config-soft); --mod-ink: var(--config-ink); }
+[data-mod='admin'] { --mod: var(--admin); --mod-soft: var(--admin-soft); --mod-ink: var(--admin-ink); }
