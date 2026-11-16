@@ -6,6 +6,7 @@ using Teager.Dsh.Infrastructure.Common;
 using Teager.Dsh.Infrastructure.Data;
 using Teager.Dsh.Infrastructure.Permissions;
 using Teager.Dsh.Infrastructure.Runtime;
+using Teager.Dsh.Infrastructure.Storage;
 
 namespace Teager.Dsh.Infrastructure.Services;
 
@@ -16,7 +17,7 @@ namespace Teager.Dsh.Infrastructure.Services;
 public record SendResult(string RunId, string SessionId, long UserMessageId);
 
 /// <summary>会话服务：创建 / 检索 / 重命名 / 归档 / 删除 / 复制 / 导出 / 发送消息 / 取消。Session 是一等对象，隶属于 Workspace。</summary>
-public class SessionService(DshDbContext db, PermissionEngine engine, PolicyService policy, RunCoordinator coordinator, RuntimeState state, SessionEventStore events, ConfigService config)
+public class SessionService(DshDbContext db, PermissionEngine engine, PolicyService policy, RunCoordinator coordinator, RuntimeState state, SessionEventStore events, ConfigService config, StoragePaths paths)
 {
     /// <summary>创建会话（需要 Workspace Member 及以上）。</summary>
     /// <param name="actor">操作者。</param>
@@ -86,13 +87,17 @@ public class SessionService(DshDbContext db, PermissionEngine engine, PolicyServ
     /// <returns>更新后的会话。</returns>
     public async Task<Session> UpdateAsync(Actor actor, string sessionId, string? title, bool? archived, string? modelKey)
     {
+        await using var transaction = await db.Database.BeginTransactionAsync();
+        await DatabaseAdmission.LockAsync(db);
         var (s, ws, wa) = await RequireAsync(actor, sessionId, WorkspaceRole.Member);
         EnsureOwnerOrAdmin(actor, s, wa);
+        if ((archived != null || modelKey != null) && await db.AgentRuns.AnyAsync(r => r.SessionId == sessionId && r.Status == RunStatus.Running)) throw ApiException.Conflict("会话正在运行，不能归档或切换模型");
         if (title != null) s.Title = Cut(title.Trim(), 100);
         if (archived != null) s.Status = archived.Value ? SessionStatus.Archived : SessionStatus.Active;
         if (modelKey != null) { if (modelKey.Length > 0) await ValidateModelAsync(ws, modelKey); s.ModelKey = modelKey.Length == 0 ? null : modelKey; }
         s.UpdatedAt = DateTime.Now;
         await db.SaveChangesAsync();
+        await transaction.CommitAsync();
         return s;
     }
 
@@ -101,10 +106,17 @@ public class SessionService(DshDbContext db, PermissionEngine engine, PolicyServ
     /// <param name="sessionId">会话 ID。</param>
     public async Task<Session> DeleteAsync(Actor actor, string sessionId)
     {
+        await using var transaction = await db.Database.BeginTransactionAsync();
+        await DatabaseAdmission.LockAsync(db);
         var (s, _, wa) = await RequireAsync(actor, sessionId, WorkspaceRole.Member);
         EnsureOwnerOrAdmin(actor, s, wa);
-        if (state.Runs.Any(r => r.Value.SessionId == s.Id)) throw ApiException.Conflict("会话正在运行，请先取消");
+        if (state.Runs.Any(r => r.Value.SessionId == s.Id) || await db.AgentRuns.AnyAsync(r => r.SessionId == s.Id && r.Status == RunStatus.Running)) throw ApiException.Conflict("会话正在运行，请先取消");
+        using var trash = new FileTrash(paths, "session", s.Id);
+        trash.Stage(paths.RunEventLog(s.Id, s.CreatedAt));
         await DeleteDataAsync(s);
+        await transaction.CommitAsync();
+        trash.Commit();
+        events.Delete(s.Id, s.CreatedAt);
         return s;
     }
 
@@ -118,7 +130,7 @@ public class SessionService(DshDbContext db, PermissionEngine engine, PolicyServ
         var copy = new Session { Id = IdGen.New("ses"), WorkspaceId = ws.Id, PoolId = ws.PoolId, Title = Cut(src.Title + "（副本）", 100), ModelKey = src.ModelKey, CreatedBy = actor.UserId };
         db.Sessions.Add(copy);
         foreach (var m in await db.SessionMessages.AsNoTracking().Where(m => m.SessionId == src.Id).OrderBy(m => m.Id).ToListAsync())
-            db.SessionMessages.Add(new SessionMessage { SessionId = copy.Id, Role = m.Role, Content = m.Content, CreatedAt = m.CreatedAt });
+            db.SessionMessages.Add(new SessionMessage { SessionId = copy.Id, Role = m.Role, Content = m.Content, CreatedAt = m.CreatedAt, ProjectReferencesJson = m.ProjectReferencesJson });
         copy.MessageCount = src.MessageCount;
         await db.SaveChangesAsync();
         return copy;
@@ -148,13 +160,18 @@ public class SessionService(DshDbContext db, PermissionEngine engine, PolicyServ
         var safe = string.Concat(s.Title.Select(c => Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
         if (format == "json")
         {
-            var arr = new JsonArray(msgs.Select(m => (JsonNode)new JsonObject { ["role"] = m.Role, ["content"] = m.Content, ["time"] = m.CreatedAt.ToString("yyyy-MM-dd HH:mm:ss") }).ToArray());
+            var arr = new JsonArray(msgs.Select(m => (JsonNode)new JsonObject { ["role"] = m.Role, ["content"] = m.Content, ["time"] = m.CreatedAt.ToString("yyyy-MM-dd HH:mm:ss"), ["projects"] = System.Text.Json.JsonSerializer.SerializeToNode(ProjectReferences.Read(m.ProjectReferencesJson), System.Text.Json.JsonSerializerOptions.Web) }).ToArray());
             var root = new JsonObject { ["id"] = s.Id, ["title"] = s.Title, ["workspace"] = ws.Name, ["createdAt"] = s.CreatedAt.ToString("yyyy-MM-dd HH:mm:ss"), ["messages"] = arr };
             return (safe + ".json", "application/json", root.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping }));
         }
         var sb = new StringBuilder();
         sb.AppendLine($"# {s.Title}").AppendLine().AppendLine($"- Workspace：{ws.Name}").AppendLine($"- 创建时间：{s.CreatedAt:yyyy-MM-dd HH:mm:ss}").AppendLine();
-        foreach (var m in msgs) sb.AppendLine($"## {(m.Role == "user" ? "用户" : m.Role == "assistant" ? "助手" : "系统")}（{m.CreatedAt:HH:mm:ss}）").AppendLine().AppendLine(m.Content).AppendLine();
+        foreach (var m in msgs)
+        {
+            sb.AppendLine($"## {(m.Role == "user" ? "用户" : m.Role == "assistant" ? "助手" : "系统")}（{m.CreatedAt:HH:mm:ss}）").AppendLine();
+            foreach (var project in ProjectReferences.Read(m.ProjectReferencesJson)) sb.AppendLine($"引用项目：{project.Name}（{project.Directory}）");
+            sb.AppendLine().AppendLine(m.Content).AppendLine();
+        }
         return (safe + ".md", "text/markdown", sb.ToString());
     }
 
@@ -184,32 +201,76 @@ public class SessionService(DshDbContext db, PermissionEngine engine, PolicyServ
     /// <param name="content">消息内容。</param>
     /// <param name="modelKey">本次使用的模型（可空）。</param>
     /// <returns>运行信息。</returns>
-    public async Task<SendResult> SendAsync(Actor actor, string sessionId, string content, string? modelKey)
+    /// <param name="requestId">Optional retry idempotency key.</param>
+    /// <param name="projectIds">Projects explicitly referenced in this message.</param>
+    public async Task<SendResult> SendAsync(Actor actor, string sessionId, string content, string? modelKey, string? requestId = null, IReadOnlyList<string>? projectIds = null)
     {
         if (string.IsNullOrWhiteSpace(content)) throw ApiException.BadRequest("消息内容不能为空");
         if (content.Length > 100_000) throw ApiException.BadRequest("消息过长（上限 100000 字符）");
+        var ids = ProjectReferences.ValidateIds(projectIds);
         var (s, ws, _) = await RequireAsync(actor, sessionId, WorkspaceRole.Member);
+        await using var transaction = await db.Database.BeginTransactionAsync();
+        await DatabaseAdmission.LockAsync(db);
+        var resource = "dsh:admission:" + ws.PoolId;
+        await db.Database.ExecuteSqlInterpolatedAsync($"DECLARE @result int; EXEC @result = sp_getapplock @Resource={resource}, @LockMode='Exclusive', @LockOwner='Transaction', @LockTimeout=10000; IF @result < 0 THROW 51000, '任务准入锁超时，请重试', 1;");
+        await db.Entry(s).ReloadAsync(); await db.Entry(ws).ReloadAsync();
+        actor = await ExecutionAuthorization.RefreshAsync(db, actor);
+        await engine.RequireWorkspaceAsync(actor, ws.Id, WorkspaceRole.Member);
+        if (ids.Length > 0) actor.RequireScope(Scopes.FilesRead);
+        if (requestId is { Length: 0 or > 64 }) throw ApiException.BadRequest("requestId 长度必须为 1—64 字符");
+        var requestHash = AuthService.Hash(ids.Length == 0 ? System.Text.Json.JsonSerializer.Serialize(new { sessionId, content, modelKey })
+            : System.Text.Json.JsonSerializer.Serialize(new { sessionId, content, modelKey, projectIds = ids }));
+        if (requestId != null)
+        {
+            var requestLock = "dsh:request:" + actor.UserId + ":" + requestId;
+            await db.Database.ExecuteSqlInterpolatedAsync($"DECLARE @result int; EXEC @result = sp_getapplock @Resource={requestLock}, @LockMode='Exclusive', @LockOwner='Transaction', @LockTimeout=10000; IF @result < 0 THROW 51000, '请求准入锁超时', 1;");
+            var existing = await db.AgentRuns.AsNoTracking().FirstOrDefaultAsync(r => r.UserId == actor.UserId && r.RequestId == requestId);
+            if (existing != null)
+            {
+                if (existing.RequestHash != requestHash) throw ApiException.Conflict("requestId 已用于另一个请求，请更换标识");
+                var messageId = await db.SessionMessages.Where(m => m.RunId == existing.Id && m.Role == "user").Select(m => m.Id).FirstAsync();
+                await transaction.CommitAsync();
+                return new SendResult(existing.Id, existing.SessionId, messageId);
+            }
+        }
         if (ws.Status != WorkspaceStatus.Active) throw ApiException.Conflict("Workspace 已归档，不能发送消息");
         if (s.Status != SessionStatus.Active) throw ApiException.Conflict("会话已归档，请先取消归档");
+        var projects = await ProjectReferences.ResolveAsync(db, paths, ws, ids);
         var pool = await db.Pools.FirstOrDefaultAsync(p => p.Id == ws.PoolId && p.Status == PoolStatus.Active) ?? throw ApiException.NotFound("所属 Pool 不存在");
-        if (!string.IsNullOrEmpty(modelKey)) await ValidateModelAsync(ws, modelKey);
+        var selectedModel = modelKey ?? s.ModelKey;
+        if (!string.IsNullOrEmpty(selectedModel)) await ValidateModelAsync(ws, selectedModel);
 
         // 同一会话同一时刻只允许一个运行；Pool 并发与配额检查
         if (state.Runs.Any(r => r.Value.SessionId == s.Id) || await db.AgentRuns.AnyAsync(r => r.SessionId == s.Id && r.Status == RunStatus.Running)) throw ApiException.Conflict("该会话正在运行，请等待完成或先取消");
         var rt = await db.Runtimes.AsNoTracking().FirstOrDefaultAsync(r => r.PoolId == pool.Id);
         if (rt?.Status == RuntimeStatus.MAINTENANCE) throw ApiException.Conflict("该 Pool 的 Runtime 正在维护中，暂不接受新任务");
         var eff = await policy.GetEffectiveAsync(pool.Id);
-        if (eff.MaxConcurrentRuns > 0 && state.ActiveCount(pool.Id) >= eff.MaxConcurrentRuns) throw ApiException.Quota($"该 Pool 并发运行数已达上限（{eff.MaxConcurrentRuns}），请稍后重试");
+        if (eff.MaxConcurrentRuns > 0 && await db.AgentRuns.CountAsync(r => r.PoolId == pool.Id && r.Status == RunStatus.Running) >= eff.MaxConcurrentRuns) throw ApiException.Quota($"该 Pool 并发运行数已达上限（{eff.MaxConcurrentRuns}），请稍后重试");
         await policy.EnsureRunQuotaAsync(pool.Id);
+        var availableModels = (await config.ResolveAsync(pool.Id, ws.Id)).Where(m => m.Kind == ConfigKind.Model && m.Enabled).ToList();
+        var model = availableModels.FirstOrDefault(m => m.Key == selectedModel) ?? availableModels.FirstOrDefault(m => m.IsDefault) ?? availableModels.FirstOrDefault();
+        var reservedTokens = ModelExecutionLimits.FromJson(model?.ParamsJson).TaskBudget;
+        if (eff.MaxTokensPerDay > 0)
+        {
+            var today = DateTime.Today;
+            var used = await db.UsageLogs.Where(u => u.PoolId == pool.Id && u.Time >= today).SumAsync(u => (long?)(u.InputTokens + u.OutputTokens)) ?? 0;
+            var completedReservations = await db.AgentRuns.Where(r => r.PoolId == pool.Id && r.StartedAt >= today && r.Status != RunStatus.Running).SumAsync(r => (long?)r.ReservedTokens) ?? 0;
+            used = Math.Max(used, completedReservations);
+            var reserved = await db.AgentRuns.Where(r => r.PoolId == pool.Id && r.Status == RunStatus.Running).SumAsync(r => (long?)r.ReservedTokens) ?? 0;
+            var remaining = eff.MaxTokensPerDay - used - reserved;
+            reservedTokens = reservedTokens == 0 ? remaining : Math.Min(reservedTokens, remaining);
+            if (reservedTokens <= 0) throw ApiException.Quota("今日模型额度已用完或已被运行中的任务预留");
+        }
 
-        var run = new AgentRun { Id = IdGen.New("run"), SessionId = s.Id, WorkspaceId = ws.Id, PoolId = pool.Id, UserId = actor.UserId };
-        var um = new SessionMessage { SessionId = s.Id, Role = "user", Content = content, RunId = run.Id };
+        var run = new AgentRun { Id = IdGen.New("run"), SessionId = s.Id, WorkspaceId = ws.Id, PoolId = pool.Id, UserId = actor.UserId, RequestId = requestId, RequestHash = requestId == null ? null : requestHash, ReservedTokens = reservedTokens };
+        var um = new SessionMessage { SessionId = s.Id, Role = "user", Content = content, RunId = run.Id, ProjectReferencesJson = projects.Count == 0 ? null : System.Text.Json.JsonSerializer.Serialize(projects) };
         db.AgentRuns.Add(run); db.SessionMessages.Add(um);
         s.MessageCount += 1; s.LastMessageAt = DateTime.Now; s.UpdatedAt = DateTime.Now;
         if (s.Title == "新会话") s.Title = Cut(content.Replace('\n', ' ').Trim(), 30);
         if (!string.IsNullOrEmpty(modelKey)) s.ModelKey = modelKey;
         await db.SaveChangesAsync();
-        coordinator.Start(new RunJob(run.Id, s.Id, actor, content, modelKey ?? s.ModelKey), pool.Id);
+        await transaction.CommitAsync();
+        coordinator.Start(new RunJob(run.Id, s.Id, actor, content, modelKey ?? s.ModelKey) { Projects = projects }, pool.Id);
         return new SendResult(run.Id, s.Id, um.Id);
     }
 
@@ -229,7 +290,6 @@ public class SessionService(DshDbContext db, PermissionEngine engine, PolicyServ
     /// <param name="s">会话。</param>
     private async Task DeleteDataAsync(Session s)
     {
-        events.Delete(s.Id, s.CreatedAt);
         db.SessionMessages.RemoveRange(await db.SessionMessages.Where(m => m.SessionId == s.Id).ToListAsync());
         db.AgentRuns.RemoveRange(await db.AgentRuns.Where(r => r.SessionId == s.Id).ToListAsync());
         db.Sessions.Remove(s);

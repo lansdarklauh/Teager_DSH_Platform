@@ -50,6 +50,17 @@ namespace Teager.Dsh.Infrastructure.Data.Migrations
                         .HasMaxLength(40)
                         .HasColumnType("nvarchar(40)");
 
+                    b.Property<string>("RequestHash")
+                        .HasMaxLength(64)
+                        .HasColumnType("nvarchar(64)");
+
+                    b.Property<string>("RequestId")
+                        .HasMaxLength(64)
+                        .HasColumnType("nvarchar(64)");
+
+                    b.Property<long>("ReservedTokens")
+                        .HasColumnType("bigint");
+
                     b.Property<string>("SessionId")
                         .IsRequired()
                         .HasMaxLength(40)
@@ -82,6 +93,14 @@ namespace Teager.Dsh.Infrastructure.Data.Migrations
 
                     b.HasIndex("PoolId", "StartedAt");
 
+                    b.HasIndex("UserId", "RequestId")
+                        .IsUnique()
+                        .HasFilter("[RequestId] IS NOT NULL");
+
+                    b.HasIndex(new[] { "SessionId" }, "UX_AgentRuns_ActiveSession")
+                        .IsUnique()
+                        .HasFilter("[Status] = N'Running'");
+
                     b.ToTable("AgentRuns");
                 });
 
@@ -92,6 +111,11 @@ namespace Teager.Dsh.Infrastructure.Data.Migrations
                         .HasColumnType("nvarchar(40)");
 
                     b.Property<string>("AllowedPoolsJson")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("nvarchar(max)");
+
+                    b.Property<string>("AllowedSharedSpacesJson")
                         .IsRequired()
                         .HasMaxLength(256)
                         .HasColumnType("nvarchar(max)");
@@ -437,6 +461,9 @@ namespace Teager.Dsh.Infrastructure.Data.Migrations
                         .HasMaxLength(40)
                         .HasColumnType("nvarchar(40)");
 
+                    b.Property<bool>("CanEditDetails")
+                        .HasColumnType("bit");
+
                     b.Property<DateTime>("CreatedAt")
                         .HasColumnType("datetime2");
 
@@ -677,6 +704,10 @@ namespace Teager.Dsh.Infrastructure.Data.Migrations
                     b.Property<DateTime>("CreatedAt")
                         .HasColumnType("datetime2");
 
+                    b.Property<string>("ProjectReferencesJson")
+                        .HasMaxLength(256)
+                        .HasColumnType("nvarchar(max)");
+
                     b.Property<string>("Role")
                         .IsRequired()
                         .HasMaxLength(256)
@@ -880,6 +911,10 @@ namespace Teager.Dsh.Infrastructure.Data.Migrations
                     b.Property<DateTime>("CreatedAt")
                         .HasColumnType("datetime2");
 
+                    b.Property<string>("DefaultWorkspaceId")
+                        .HasMaxLength(40)
+                        .HasColumnType("nvarchar(40)");
+
                     b.Property<string>("DisplayName")
                         .IsRequired()
                         .HasMaxLength(256)
@@ -939,6 +974,10 @@ namespace Teager.Dsh.Infrastructure.Data.Migrations
                     b.Property<DateTime?>("ArchivedAt")
                         .HasColumnType("datetime2");
 
+                    b.Property<string>("AssignedUserId")
+                        .HasMaxLength(40)
+                        .HasColumnType("nvarchar(40)");
+
                     b.Property<DateTime>("CreatedAt")
                         .HasColumnType("datetime2");
 
@@ -986,9 +1025,69 @@ namespace Teager.Dsh.Infrastructure.Data.Migrations
 
                     b.HasKey("Id");
 
+                    b.HasIndex("AssignedUserId")
+                        .IsUnique()
+                        .HasFilter("[AssignedUserId] IS NOT NULL");
+
                     b.HasIndex("PoolId");
 
                     b.ToTable("Workspaces");
+                });
+
+            modelBuilder.Entity("Teager.Dsh.Domain.WorkspaceExecution", b =>
+                {
+                    b.Property<string>("Id")
+                        .HasMaxLength(256)
+                        .HasColumnType("nvarchar(256)");
+
+                    b.Property<string>("ContainerName")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("nvarchar(256)");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("datetime2");
+
+                    b.Property<int?>("ExitCode")
+                        .HasColumnType("int");
+
+                    b.Property<DateTime>("ExpiresAt")
+                        .HasColumnType("datetime2");
+
+                    b.Property<string>("Kind")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("nvarchar(256)");
+
+                    b.Property<string>("PortsJson")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("nvarchar(256)");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("nvarchar(256)");
+
+                    b.Property<string>("TokenId")
+                        .HasMaxLength(256)
+                        .HasColumnType("nvarchar(256)");
+
+                    b.Property<string>("UserId")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("nvarchar(256)");
+
+                    b.Property<string>("WorkspaceId")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("nvarchar(256)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("WorkspaceId", "Status");
+
+                    b.ToTable("WorkspaceExecution", (string)null);
                 });
 
             modelBuilder.Entity("Teager.Dsh.Domain.WorkspaceMember", b =>
@@ -1028,6 +1127,42 @@ namespace Teager.Dsh.Infrastructure.Data.Migrations
                         .IsUnique();
 
                     b.ToTable("WorkspaceMembers");
+                });
+
+            modelBuilder.Entity("Teager.Dsh.Domain.WorkspaceProject", b =>
+                {
+                    b.Property<string>("Id")
+                        .HasMaxLength(256)
+                        .HasColumnType("nvarchar(256)");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("datetime2");
+
+                    b.Property<string>("Description")
+                        .HasMaxLength(1000)
+                        .HasColumnType("nvarchar(1000)");
+
+                    b.Property<string>("Directory")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("nvarchar(256)");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("nvarchar(256)");
+
+                    b.Property<string>("WorkspaceId")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("nvarchar(256)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("WorkspaceId", "Name")
+                        .IsUnique();
+
+                    b.ToTable("WorkspaceProject", (string)null);
                 });
 
             modelBuilder.Entity("Teager.Dsh.Domain.WorkspaceSharedSpaceMount", b =>

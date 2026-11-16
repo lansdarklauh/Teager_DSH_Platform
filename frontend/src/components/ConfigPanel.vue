@@ -32,21 +32,21 @@ const open = ref(false)
 const saving = ref(false)
 const isEdit = ref(false)
 function blank() {
-  return { key: '', displayName: '', enabled: true, content: '', provider: 'deepseek-official', model: '', baseUrl: '', apiKeyEnv: '', reasoningEffort: '', isDefault: false,
+  return { key: '', displayName: '', enabled: true, content: '', provider: 'deepseek-official', model: '', baseUrl: '', apiKeyEnv: '', reasoningEffort: '', isDefault: false, taskBudget: 0, contextWindow: 0, modelParams: {},
     transport: 'stdio', command: '', args: '', env: '', url: '', headers: '', package: '', pluginConfig: '' }
 }
 function add() { form.value = blank(); isEdit.value = false; open.value = true }
 function edit(r: any) {
   const p = r.params || {}
   form.value = { ...blank(), key: r.key, displayName: r.displayName || '', enabled: r.enabled, content: r.content || '', ...p,
-    args: (p.args || []).join('\n'), env: Object.entries(p.env || {}).map(([k, v]) => `${k}=${v}`).join('\n'), headers: Object.entries(p.headers || {}).map(([k, v]) => `${k}=${v}`).join('\n'), pluginConfig: p.config ? JSON.stringify(p.config, null, 2) : '' }
+    modelParams: p, args: (p.args || []).join('\n'), env: Object.entries(p.env || {}).map(([k, v]) => `${k}=${v}`).join('\n'), headers: Object.entries(p.headers || {}).map(([k, v]) => `${k}=${v}`).join('\n'), pluginConfig: p.config ? JSON.stringify(p.config, null, 2) : '' }
   isEdit.value = true; open.value = true
 }
 const lines = (s: string) => s.split('\n').map((x) => x.trim()).filter(Boolean)
 const kvObj = (s: string) => Object.fromEntries(lines(s).map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]))
 function buildParams() {
   const f = form.value
-  if (props.kind === 'Model') return { provider: f.provider || undefined, model: f.model || undefined, baseUrl: f.baseUrl || undefined, apiKeyEnv: f.apiKeyEnv || undefined, reasoningEffort: f.reasoningEffort || undefined, isDefault: !!f.isDefault }
+  if (props.kind === 'Model') return { ...f.modelParams, provider: f.provider || undefined, model: f.model || undefined, baseUrl: f.baseUrl || undefined, apiKeyEnv: f.apiKeyEnv || undefined, reasoningEffort: f.reasoningEffort || undefined, isDefault: !!f.isDefault, taskBudget: f.taskBudget ?? 0, contextWindow: f.contextWindow ?? 0 }
   if (props.kind === 'Mcp') return f.transport === 'stdio' ? { transport: 'stdio', command: f.command, args: lines(f.args), env: kvObj(f.env) } : { transport: 'streamable-http', url: f.url, headers: kvObj(f.headers) }
   if (props.kind === 'Plugin') {
     let cfg: any
@@ -85,6 +85,7 @@ const effRows = computed(() => effective.value.map((e) => ({ ...e, params: parse
           <template #default="{ record }"><b>{{ record.key }}</b><div v-if="record.displayName" class="muted small ellipsis" style="max-width: 320px">{{ record.displayName }}</div></template>
         </a-table-column>
         <a-table-column v-if="kind === 'Model'" title="Provider / 地址" key="p"><template #default="{ record }"><span class="mono">{{ record.params.provider || '—' }}</span><div v-if="record.params.baseUrl" class="muted small mono">{{ record.params.baseUrl }}</div></template></a-table-column>
+        <a-table-column v-if="kind === 'Model'" title="任务预算 / 上下文" key="limits"><template #default="{ record }"><div>预算：{{ record.params.taskBudget || '模型原生设置' }}</div><div class="muted small">上下文：{{ record.params.contextWindow || '模型原生设置' }}</div></template></a-table-column>
         <a-table-column v-if="kind === 'Plugin'" title="插件包" key="pk"><template #default="{ record }"><span class="mono">{{ record.params.package }}</span></template></a-table-column>
         <a-table-column v-if="kind === 'Mcp'" title="连接方式" key="m"><template #default="{ record }"><span class="tag token">{{ record.params.transport }}</span> <span class="mono muted small">{{ record.params.command || record.params.url }}</span></template></a-table-column>
         <a-table-column title="状态" key="s" :width="190">
@@ -111,6 +112,7 @@ const effRows = computed(() => effective.value.map((e) => ({ ...e, params: parse
       </div>
       <a-table :data-source="own" :loading="loading" :pagination="false" row-key="id" size="middle" :locale="{ emptyText: `${scopeText}还没有定义${kindText}` }">
         <a-table-column title="名称" key="key"><template #default="{ record }"><b>{{ record.key }}</b><div v-if="record.displayName" class="muted small">{{ record.displayName }}</div></template></a-table-column>
+        <a-table-column v-if="kind === 'Model'" title="任务预算 / 上下文" key="limits"><template #default="{ record }"><div>预算：{{ record.params?.taskBudget || '模型原生设置' }}</div><div class="muted small">上下文：{{ record.params?.contextWindow || '模型原生设置' }}</div></template></a-table-column>
         <a-table-column title="状态" key="e" :width="100"><template #default="{ record }"><span class="tag dot" :class="record.enabled ? 'ok' : 'danger'">{{ record.enabled ? '启用' : '停用' }}</span></template></a-table-column>
         <a-table-column title="更新" key="u" :width="180"><template #default="{ record }"><span class="muted small">{{ record.updatedBy }} · {{ record.updatedAt?.slice(0, 16).replace('T', ' ') }}</span></template></a-table-column>
         <a-table-column v-if="canEdit" title="操作" key="op" :width="120" align="right">
@@ -132,9 +134,11 @@ const effRows = computed(() => effective.value.map((e) => ({ ...e, params: parse
             <a-form-item label="Provider"><a-input v-model:value="form.provider" placeholder="deepseek-official 或自定义" /></a-form-item>
             <a-form-item label="模型 ID（默认同模型键）"><a-input v-model:value="form.model" /></a-form-item>
             <a-form-item label="OpenAI 兼容 Base URL（自定义模型时填写）"><a-input v-model:value="form.baseUrl" placeholder="https://host/v1" /></a-form-item>
-            <a-form-item label="API Key 环境变量名（对应密钥名称）"><a-input v-model:value="form.apiKeyEnv" placeholder="DEEPSEEK_API_KEY" /></a-form-item>
+            <a-form-item label="上游密钥名称" extra="先在同层级的密钥模块保存 API Key，再在这里填写其名称；请勿填写密钥值。"><a-input v-model:value="form.apiKeyEnv" placeholder="例如 MINIMAX_API_KEY" /></a-form-item>
             <a-form-item label="推理强度"><a-select v-model:value="form.reasoningEffort" allow-clear :options="[{ value: 'low' }, { value: 'medium' }, { value: 'high' }]" /></a-form-item>
             <a-form-item label="设为默认模型"><a-switch v-model:checked="form.isDefault" /></a-form-item>
+            <a-form-item label="单次任务预算" extra="默认 0：平台不额外限制累计预算。正数按请求字节数＋预留输出额度累计扣减，仍受每日额度限制。"><a-input-number v-model:value="form.taskBudget" :min="0" :precision="0" style="width: 100%" /></a-form-item>
+            <a-form-item label="上下文大小（Token）" extra="默认 0：采用模型目录/引擎原生容量；无法识别的自定义模型请填写供应商公布的容量。"><a-input-number v-model:value="form.contextWindow" :min="0" :max="2147483647" :precision="0" style="width: 100%" /></a-form-item>
           </div>
         </template>
         <template v-else-if="kind === 'Mcp'">

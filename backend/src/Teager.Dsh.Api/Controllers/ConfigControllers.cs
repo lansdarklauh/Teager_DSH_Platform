@@ -39,7 +39,8 @@ public record SecretRequest(ConfigScope Scope, string? ScopeId, string Name, str
 /// <param name="ExpiresInDays">有效天数。</param>
 /// <param name="ExpiresInHours">有效小时（临时 Token）。</param>
 /// <param name="ServiceAccountId">服务账号 ID（服务 Token）。</param>
-public record CreateTokenRequest(string Name, TokenType? Type, string[]? Scopes, string[]? AllowedPools, string[]? AllowedWorkspaces, int? ExpiresInDays, int? ExpiresInHours, string? ServiceAccountId);
+/// <param name="AllowedSharedSpaces">Explicit shared-space whitelist.</param>
+public record CreateTokenRequest(string Name, TokenType? Type, string[]? Scopes, string[]? AllowedPools, string[]? AllowedWorkspaces, int? ExpiresInDays, int? ExpiresInHours, string? ServiceAccountId, string[]? AllowedSharedSpaces = null);
 
 /// <summary>模型 / Skill / MCP 配置：按层级维护，逐级继承（子级只能收紧，扩大需授权）。</summary>
 public class ConfigsController(ActorAccessor accessor, ConfigService config, AuditService audit, DshDbContext db) : ApiBase(accessor)
@@ -122,7 +123,7 @@ public class TokensController(ActorAccessor accessor, TokenService tokens, Audit
     [HttpPost("tokens")]
     public async Task<object> Create(CreateTokenRequest req)
     {
-        var (t, plain) = await tokens.CreateAsync(Me, req.Name, req.Type ?? TokenType.Personal, req.Scopes ?? [], req.AllowedPools ?? [], req.AllowedWorkspaces ?? [], req.ExpiresInDays, req.ExpiresInHours, req.ServiceAccountId);
+        var (t, plain) = await tokens.CreateAsync(Me, req.Name, req.Type ?? TokenType.Personal, req.Scopes ?? [], req.AllowedPools ?? [], req.AllowedWorkspaces ?? [], req.ExpiresInDays, req.ExpiresInHours, req.ServiceAccountId, req.AllowedSharedSpaces);
         await audit.LogAsync(Me, "token.create", "ApiToken", t.Id, detail: $"创建 {t.Type} Token「{t.Name}」（{t.TokenPrefix}…），过期：{t.ExpiresAt:yyyy-MM-dd HH:mm}，Scope：{t.ScopesJson}");
         return new { t.Id, t.Name, Token = plain, t.ExpiresAt, Notice = "Token 仅显示一次，请立即保存" };
     }

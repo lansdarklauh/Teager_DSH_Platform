@@ -1,6 +1,7 @@
 import axios, { type AxiosRequestConfig } from 'axios'
 import { message } from 'ant-design-vue'
 import router from '@/router'
+import { useAuthStore } from '@/stores/auth'
 
 /** 通用 axios 实例：携带 Cookie 会话；写请求带 CSRF 头（与后端 SameSite Cookie 配合）。 */
 export const http = axios.create({
@@ -21,6 +22,7 @@ http.interceptors.response.use(
     const status = err.response?.status
     const data = err.response?.data
     const msg = (data && typeof data === 'object' && data.message) || err.message || '请求失败'
+    if (status === 401) useAuthStore().clearIdentity()
     if (status === 401 && router.currentRoute.value.name !== 'login') {
       router.replace({ name: 'login', query: { redirect: router.currentRoute.value.fullPath } })
     } else if (!(err.config as AxiosRequestConfig)?.silent && status !== 401) {

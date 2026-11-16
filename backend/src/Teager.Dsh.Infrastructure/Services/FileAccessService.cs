@@ -17,7 +17,7 @@ namespace Teager.Dsh.Infrastructure.Services;
 public record FileArea(string Root, bool IsShared, Workspace? Workspace, SharedSpace? Space, bool Writable, string Label);
 
 /// <summary>文件访问服务：把“Workspace 私有文件 / Workspace 内挂载的共享空间 / 直接访问共享空间”统一解析为受限存储区域，并记录共享空间审计。</summary>
-public class FileAccessService(DshDbContext db, PermissionEngine engine, StoragePaths paths, WorkspaceService workspaces, SharedSpaceService spaces, AuditService audit, FileVersionStore versions)
+public class FileAccessService(DshDbContext db, PermissionEngine engine, StoragePaths paths, WorkspaceService workspaces, SharedSpaceService spaces, AuditService audit, FileVersionStore versions, Microsoft.Extensions.Options.IOptions<Teager.Dsh.Infrastructure.Options.DshOptions> options)
 {
     /// <summary>解析 Workspace 内的存储区域：area 为 <c>files</c>（私有文件）或 <c>shared/{挂载名}</c>（共享空间）。</summary>
     /// <param name="actor">操作者。</param>
@@ -88,6 +88,7 @@ public class FileAccessService(DshDbContext db, PermissionEngine engine, Storage
     /// <param name="version">版本号。</param>
     public async Task RestoreVersionAsync(Actor actor, FileArea a, string path, string version)
     {
+        await EnsureQuotaAsync(a, versions.Size(AreaKey(a), path, version), path);
         versions.Restore(AreaKey(a), a.Root, path, version);
         await RecordAsync(actor, a, "write", path, "恢复到历史版本 " + version);
     }
@@ -95,10 +96,33 @@ public class FileAccessService(DshDbContext db, PermissionEngine engine, Storage
     /// <summary>写入前检查配额（私有文件按 Workspace 策略，共享空间按其配额）。</summary>
     /// <param name="area">存储区域。</param>
     /// <param name="addBytes">新增字节数。</param>
-    public async Task EnsureQuotaAsync(FileArea area, long addBytes)
+    /// <param name="replacePath">Path being replaced, if any.</param>
+    public async Task EnsureQuotaAsync(FileArea area, long addBytes, string? replacePath = null)
     {
+        if (replacePath != null)
+        {
+            var target = FileStore.Resolve(area.Root, replacePath);
+            if (File.Exists(target)) addBytes = Math.Max(0, addBytes - new FileInfo(target).Length);
+            if (options.Value.Sandbox.Enabled && !File.Exists(target) && !Directory.Exists(target))
+            {
+                var count = StorageQuota.CountEntries(area.Root);
+                if (!area.IsShared && area.Workspace != null) count += StorageQuota.CountEntries(Path.Combine(paths.WorkspaceRoot(area.Workspace.Id), "home"));
+                var newEntries = 1;
+                for (var parent = Path.GetDirectoryName(target); parent != null && parent != area.Root && !Directory.Exists(parent); parent = Path.GetDirectoryName(parent)) newEntries++;
+                if (count + newEntries > options.Value.Sandbox.MaxFiles) throw ApiException.Quota("个人环境的文件数已达上限");
+            }
+        }
         if (area.IsShared && area.Space != null) await spaces.EnsureQuotaAsync(area.Space, addBytes);
         else if (area.Workspace != null) await workspaces.EnsureStorageQuotaAsync(area.Workspace, addBytes);
+        if (options.Value.Sandbox.Enabled)
+        {
+            var used = FileStore.DirSize(area.Root);
+            var id = AreaKey(area);
+            if (!area.IsShared && area.Workspace != null) used += FileStore.DirSize(Path.Combine(paths.WorkspaceRoot(id), "home"));
+            used += StorageQuota.OrphanBytes(paths, id);
+            if (used + addBytes > (long)options.Value.Sandbox.MaxStorageMb * 1024 * 1024)
+                throw ApiException.Quota("个人隔离环境的存储配额已满");
+        }
     }
 
     /// <summary>记录共享空间审计（READ / WRITE / DELETE / RENAME / MOVE）；私有文件区域仅记录写与删除。</summary>

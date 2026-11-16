@@ -43,11 +43,17 @@ public class SessionEventStore(StoragePaths paths)
         var file = paths.RunEventLog(sessionId, createdAt);
         if (File.Exists(file)) File.Delete(file);
         _seq.TryRemove(sessionId, out _); _locks.TryRemove(sessionId, out _);
+        if (_subs.TryRemove(sessionId, out var subscriptions)) lock (subscriptions) foreach (var ch in subscriptions) ch.Writer.TryComplete();
     }
 
     /// <summary>当前序号。</summary>
     /// <param name="sessionId">会话 ID。</param>
     public long CurrentSeq(string sessionId) => _seq.GetValueOrDefault(sessionId);
+
+    public void ForgetDeleted(HashSet<string> remaining)
+    {
+        foreach (var id in _seq.Keys.Where(id => !remaining.Contains(id))) { _seq.TryRemove(id, out _); _locks.TryRemove(id, out _); }
+    }
 
     /// <summary>追加事件：分配 seq 与本地时间戳，写入日志文件，并广播给订阅者。</summary>
     /// <param name="sessionId">会话 ID。</param>
@@ -101,10 +107,10 @@ public class SessionEventStore(StoragePaths paths)
     /// <returns>通道读取器与取消订阅句柄。</returns>
     public (ChannelReader<JsonObject> Reader, IDisposable Handle) Subscribe(string sessionId)
     {
-        var ch = Channel.CreateUnbounded<JsonObject>();
+        var ch = Channel.CreateBounded<JsonObject>(new BoundedChannelOptions(256) { FullMode = BoundedChannelFullMode.Wait });
         var list = _subs.GetOrAdd(sessionId, _ => []);
         lock (list) list.Add(ch);
-        return (ch.Reader, new Unsub(() => { lock (list) list.Remove(ch); ch.Writer.TryComplete(); }));
+        return (ch.Reader, new Unsub(() => { lock (list) { list.Remove(ch); if (list.Count == 0) _subs.TryRemove(new KeyValuePair<string, List<Channel<JsonObject>>>(sessionId, list)); } ch.Writer.TryComplete(); }));
     }
 
     /// <summary>向订阅者发布事件（克隆一份，避免多消费者共享同一节点）。</summary>
@@ -114,7 +120,8 @@ public class SessionEventStore(StoragePaths paths)
     {
         if (!_subs.TryGetValue(sessionId, out var list)) return;
         Channel<JsonObject>[] targets; lock (list) targets = list.ToArray();
-        foreach (var ch in targets) ch.Writer.TryWrite((JsonObject)JsonNode.Parse(evt.ToJsonString())!);
+        foreach (var ch in targets)
+            if (!ch.Writer.TryWrite((JsonObject)JsonNode.Parse(evt.ToJsonString())!)) ch.Writer.TryComplete(); // slow clients reconnect from persisted seq
     }
 
     /// <summary>取消订阅句柄。</summary>

@@ -24,7 +24,9 @@ public record UpdateSessionRequest(string? Title, bool? Archived, string? Model)
 /// <summary>发送消息请求。</summary>
 /// <param name="Content">消息内容。</param>
 /// <param name="Model">本次使用的模型。</param>
-public record SendMessageRequest(string Content, string? Model);
+/// <param name="RequestId">Optional retry idempotency key.</param>
+/// <param name="ProjectIds">Projects belonging to the session Workspace.</param>
+public record SendMessageRequest(string Content, string? Model, string? RequestId = null, List<string>? ProjectIds = null);
 
 /// <summary>会话与 Agent 交互：创建 / 检索 / 发送消息（异步或同步等待）/ SSE 流式事件 / 取消 / 导出。Web 与 SDK 走同一套接口。</summary>
 public class SessionsController(ActorAccessor accessor, SessionService sessions, SessionEventStore events, RuntimeState state, AuditService audit, DshDbContext db,
@@ -95,7 +97,7 @@ public class SessionsController(ActorAccessor accessor, SessionService sessions,
     /// <summary>消息列表（文本摘要）。</summary>
     [HttpGet("sessions/{id}/messages"), Scope(Scopes.SessionRead)]
     public async Task<object> Messages(string id, [FromQuery] long after = 0, [FromQuery] int limit = 200)
-        => (await sessions.MessagesAsync(Me, id, after, limit)).Select(m => new { m.Id, m.Role, m.Content, m.RunId, m.CreatedAt });
+        => (await sessions.MessagesAsync(Me, id, after, limit)).Select(m => new { m.Id, m.Role, m.Content, m.RunId, m.CreatedAt, Projects = ProjectReferences.Read(m.ProjectReferencesJson) });
 
     /// <summary>
     /// 发送消息。默认异步：立即返回 202 与 runId，通过 events 接口订阅流式结果；
@@ -106,19 +108,20 @@ public class SessionsController(ActorAccessor accessor, SessionService sessions,
     {
         if (!wait)
         {
-            var r = await sessions.SendAsync(Me, id, req.Content, req.Model);
+            var r = await sessions.SendAsync(Me, id, req.Content, req.Model, req.RequestId, req.ProjectIds);
             return Accepted(new { r.RunId, r.SessionId, r.UserMessageId });
         }
         // 同步模式：先订阅再发送，避免错过 run_end
         var (reader, handle) = events.Subscribe(id);
         using var _ = handle;
-        var res = await sessions.SendAsync(Me, id, req.Content, req.Model);
+        var res = await sessions.SendAsync(Me, id, req.Content, req.Model, req.RequestId, req.ProjectIds);
         var deadline = TimeSpan.FromMinutes(opt.Value.Runtime.RunTimeoutMinutes + 1);
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(HttpContext.RequestAborted); cts.CancelAfter(deadline);
-        JsonObject? end = null;
+        var current = await db.AgentRuns.AsNoTracking().FirstAsync(r => r.Id == res.RunId);
+        JsonObject? end = current.Status == RunStatus.Running ? null : new JsonObject { ["status"] = current.Status.ToString(), ["error"] = current.ErrorMessage, ["inputTokens"] = current.InputTokens, ["outputTokens"] = current.OutputTokens };
         try
         {
-            await foreach (var e in reader.ReadAllAsync(cts.Token))
+            if (end == null) await foreach (var e in reader.ReadAllAsync(cts.Token))
                 if (e["type"]?.GetValue<string>() == "run_end" && e["runId"]?.GetValue<string>() == res.RunId) { end = e; break; }
         }
         catch (OperationCanceledException) { }

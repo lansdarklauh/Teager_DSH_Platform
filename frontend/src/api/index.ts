@@ -3,6 +3,16 @@ import { http, unwrap } from './http'
 type Dict = Record<string, any>
 const q = (o: Dict = {}) => ({ params: Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined && v !== null && v !== '')) })
 
+/** 消息重试标识：局域网 HTTP 没有 randomUUID，getRandomValues 仍可使用。 */
+function createRequestId(): string {
+  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID()
+  const bytes = crypto.getRandomValues(new Uint8Array(16))
+  bytes[6] = (bytes[6] & 0x0f) | 0x40
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+  const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
 /** 认证 */
 export const authApi = {
   login: (username: string, password: string) => unwrap(http.post('/auth/login', { username, password }, { silent: true })),
@@ -104,6 +114,8 @@ export const spaceApi = {
 }
 
 /** 会话 */
+export const projectApi = { list: (workspaceId: string) => unwrap(http.get(`/workspaces/${workspaceId}/projects`)) }
+
 export const sessionApi = {
   list: (workspaceId: string, p: Dict = {}) => unwrap(http.get('/sessions', q({ workspaceId, ...p }))),
   search: (keyword: string) => unwrap(http.get('/sessions/search', q({ q: keyword }))),
@@ -112,8 +124,11 @@ export const sessionApi = {
   update: (id: string, b: Dict) => unwrap(http.patch(`/sessions/${id}`, b)),
   remove: (id: string) => unwrap(http.delete(`/sessions/${id}`)),
   duplicate: (id: string) => unwrap(http.post(`/sessions/${id}/duplicate`)),
-  messages: (id: string) => unwrap(http.get(`/sessions/${id}/messages`)),
-  send: (id: string, content: string, model?: string) => unwrap(http.post(`/sessions/${id}/messages`, { content, model })),
+  messages: async (id: string) => {
+    const messages: any[] = []; let afterId = 0
+    for (;;) { const page = await unwrap(http.get(`/sessions/${id}/messages`, { params: { after: afterId, limit: 500 } })) as any[]; messages.push(...page); if (page.length < 500) return messages; afterId = page[page.length - 1].id }
+  },
+  send: (id: string, content: string, model?: string, projectIds?: string[]) => unwrap(http.post(`/sessions/${id}/messages`, { content, model, projectIds, requestId: createRequestId() })),
   cancel: (id: string) => unwrap(http.post(`/sessions/${id}/cancel`)),
   runs: (id: string) => unwrap(http.get(`/sessions/${id}/runs`)),
   history: (id: string, runId?: string, after?: number) => unwrap(http.get(`/sessions/${id}/events/history`, q({ runId, after }))),

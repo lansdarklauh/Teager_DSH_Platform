@@ -30,7 +30,7 @@ const archived = computed(() => space.value?.status === 'Archived')
 async function load() {
   space.value = await spaceApi.get(id.value)
   info.value = { name: space.value.name, description: space.value.description || '', quotaMb: space.value.quotaMb, mountName: space.value.mountName }
-  grants.value = (await spaceApi.grants(id.value)) as any[]
+  if (canManage.value) grants.value = (await spaceApi.grants(id.value)) as any[]
   explain.value = await spaceApi.explain(id.value)
   if (canManage.value) mounts.value = (await spaceApi.mounts(id.value)) as any[]
 }
@@ -63,7 +63,7 @@ const pct = computed(() => (space.value?.quotaMb ? Math.min(100, Math.round((spa
     <a-tabs v-model:active-key="tab" :destroy-inactive-tab-pane="true">
       <a-tab-pane key="files" tab="文件"><div class="card"><FileManager :base="`/shared-spaces/${id}`" :can-write="canWrite && !archived" /></div></a-tab-pane>
 
-      <a-tab-pane key="grants" tab="授权">
+      <a-tab-pane v-if="canManage" key="grants" tab="授权">
         <div class="stack">
           <div class="row"><div class="muted">授权决定谁能使用；<b>显式拒绝</b>优先于一切授权；<b>向下继承</b>关闭时，只有被授权 Pool 的直接成员可用。</div><span class="spacer" /><a-button v-if="canManage" type="primary" @click="g.open = true"><PlusOutlined /> 新增授权</a-button></div>
           <div class="card flush">
@@ -99,7 +99,7 @@ const pct = computed(() => (space.value?.quotaMb ? Math.min(100, Math.round((spa
         </div>
       </a-tab-pane>
 
-      <a-tab-pane key="audit" tab="访问审计"><AuditPanel default-action="sharedspace" :default-keyword="id" /></a-tab-pane>
+      <a-tab-pane v-if="canManage" key="audit" tab="访问审计"><AuditPanel default-action="sharedspace" :default-keyword="id" /></a-tab-pane>
 
       <a-tab-pane v-if="canManage" key="settings" tab="设置">
         <div class="stack">

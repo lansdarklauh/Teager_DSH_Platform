@@ -28,7 +28,7 @@ public partial class FileVersionStore(StoragePaths paths, IOptions<DshOptions> o
     /// <param name="areaKey">区域键（Workspace ID 或共享空间 ID）。</param>
     /// <param name="rel">相对路径。</param>
     private string Dir(string areaKey, string rel) =>
-        Path.Combine(paths.Data, "versions", areaKey, Convert.ToHexString(SHA1.HashData(Encoding.UTF8.GetBytes(FileStore.Normalize(rel).ToLowerInvariant()))).ToLowerInvariant()[..20]);
+        Path.Combine(paths.Data, "versions", areaKey, Convert.ToHexString(SHA1.HashData(Encoding.UTF8.GetBytes(OperatingSystem.IsWindows() ? FileStore.Normalize(rel).ToLowerInvariant() : FileStore.Normalize(rel)))).ToLowerInvariant()[..20]);
 
     /// <summary>在文件被修改 / 删除前保存当前内容为一个历史版本，并只保留最近 N 个。</summary>
     /// <param name="areaKey">区域键。</param>
@@ -45,6 +45,11 @@ public partial class FileVersionStore(StoragePaths paths, IOptions<DshOptions> o
         File.WriteAllText(Path.Combine(dir, "path.txt"), FileStore.Normalize(rel), new UTF8Encoding(false));
         File.Copy(full, Path.Combine(dir, DateTime.Now.ToString("yyyyMMddHHmmssfff") + ".v"), true);
         foreach (var old in Directory.EnumerateFiles(dir, "*.v").OrderByDescending(f => f).Skip(keep)) File.Delete(old);
+        var historyRoot = Path.GetDirectoryName(dir)!;
+        var budget = opt.Value.Sandbox.Enabled ? (long)opt.Value.Sandbox.MaxStorageMb * 1024 * 1024 : 5120L * 1024 * 1024;
+        var history = Directory.EnumerateFiles(historyRoot, "*.v", SearchOption.AllDirectories).Select(f => new FileInfo(f)).OrderBy(f => f.Name).ToList();
+        var bytes = history.Sum(f => f.Length);
+        foreach (var old in history) { if (bytes <= budget) break; bytes -= old.Length; old.Delete(); }
     }
 
     /// <summary>列出文件的历史版本（新到旧）。</summary>
@@ -81,11 +86,15 @@ public partial class FileVersionStore(StoragePaths paths, IOptions<DshOptions> o
     public void Restore(string areaKey, string root, string rel, string version)
     {
         var f = VersionFile(areaKey, rel, version);
+        // Snapshot pruning may remove the selected version. Read it first.
+        var content = File.ReadAllBytes(f);
         Snapshot(areaKey, root, rel);
         var target = FileStore.Resolve(root, rel);
         Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-        File.Copy(f, target, true);
+        File.WriteAllBytes(target, content);
     }
+
+    public long Size(string areaKey, string rel, string version) => new FileInfo(VersionFile(areaKey, rel, version)).Length;
 
     /// <summary>定位并校验版本文件。</summary>
     /// <param name="areaKey">区域键。</param>

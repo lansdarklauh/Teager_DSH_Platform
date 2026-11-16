@@ -32,6 +32,8 @@ public class User
     public PlatformRole Role { get; set; } = PlatformRole.User;
     /// <summary>是否服务账号（仅能通过 Service Token 访问）。</summary>
     public bool IsServiceAccount { get; set; }
+    /// <summary>该用户的默认个人工作空间。</summary>
+    public string? DefaultWorkspaceId { get; set; }
     /// <summary>状态。</summary>
     public UserStatus Status { get; set; } = UserStatus.Active;
     /// <summary>最近登录时间。</summary>
@@ -116,6 +118,8 @@ public class PoolMember
     public PoolRole Role { get; set; } = PoolRole.Member;
     /// <summary>成员类型（固定 DIRECT）。</summary>
     public string MembershipType { get; set; } = "DIRECT";
+    /// <summary>是否允许该成员修改 Pool 基本信息。不能据此管理成员、配置或结构。</summary>
+    public bool CanEditDetails { get; set; }
     /// <summary>加入时间。</summary>
     public DateTime CreatedAt { get; set; } = DateTime.Now;
 }
@@ -127,6 +131,8 @@ public class Workspace
     public string Id { get; set; } = "";
     /// <summary>所属 Pool（仅一个）。</summary>
     public string PoolId { get; set; } = "";
+    /// <summary>个人工作空间归属的用户。部门工作空间为空。</summary>
+    public string? AssignedUserId { get; set; }
     /// <summary>名称。</summary>
     public string Name { get; set; } = "";
     /// <summary>描述。</summary>
@@ -285,6 +291,8 @@ public class SessionMessage
     public string Content { get; set; } = "";
     /// <summary>关联的运行 ID。</summary>
     public string? RunId { get; set; }
+    /// <summary>本条消息引用的项目（JSON）。没有引用时为空。</summary>
+    public string? ProjectReferencesJson { get; set; }
     /// <summary>创建时间。</summary>
     public DateTime CreatedAt { get; set; } = DateTime.Now;
 }
@@ -318,6 +326,12 @@ public class AgentRun
     public int ToolCalls { get; set; }
     /// <summary>失败原因。</summary>
     public string? ErrorMessage { get; set; }
+    /// <summary>调用方幂等请求号。同一用户重复提交时用于找回同一次运行。</summary>
+    public string? RequestId { get; set; }
+    /// <summary>请求内容摘要，用于确认幂等请求没有被改写。</summary>
+    public string? RequestHash { get; set; }
+    /// <summary>本次运行预留的模型额度。</summary>
+    public long ReservedTokens { get; set; }
 }
 
 /// <summary>Runtime 实例：每个 Pool 一个逻辑独立的运行环境（产品方案中的 Runtime 表）。</summary>
@@ -383,6 +397,8 @@ public class ApiToken
     public string AllowedPoolsJson { get; set; } = "[]";
     /// <summary>允许的 Workspace（JSON 数组，空表示不限）。</summary>
     public string AllowedWorkspacesJson { get; set; } = "[]";
+    /// <summary>允许的共享空间（JSON 数组，空表示不限）。</summary>
+    public string AllowedSharedSpacesJson { get; set; } = "[]";
     /// <summary>过期时间（空表示永不过期）。</summary>
     public DateTime? ExpiresAt { get; set; }
     /// <summary>吊销时间。</summary>

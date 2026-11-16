@@ -1,0 +1,33 @@
+{
+  "checks": [
+    "login assigns distinct personal workbenches",
+    "foreign workspaces/files/projects return 404",
+    "resource creation/clone/user lookup forbidden",
+    "projects and UTF-8 files work; root deletion denied",
+    "conversation completes; foreign session inaccessible",
+    "SDK token stays personal; no management or direct command scope",
+    "Pool editor can edit details only; members/policy/runtime stay admin-only",
+    "workspace assignment rejects ordinary users and conflicting owners",
+    "unsupported/invalid Authorization cannot fall back to cookies; numeric roles rejected",
+    "resource-scoped administrator Token cannot widen its resource/management range",
+    "parallel retries create one run/message; active session deletion/concurrent sends rejected",
+    "ordinary user can create/restore/delete personal file snapshots",
+    "disabling a user invalidates access and cancels an already-running task",
+    "Python SDK creates/streams/reads/deletes its personal session and receives the matching run_end",
+    "project references reach Agent context and persist as separate metadata, including long Chinese descriptions",
+    "project reference retry is idempotent; changing references conflicts; duplication/export preserve references",
+    "foreign/missing/removed/directoryless/duplicate/excess project references are rejected without new messages",
+    "Python SDK send/stream support project_ids and retain project metadata",
+    "real non-root container command shares personal files and hides control/backing directories",
+    "pip/npm dependencies install as ordinary user and persist into later executions",
+    "real shared RO mount rejects writes; admin-assigned RW enables writes without management",
+    "Token execution mounts respect explicit shared whitelist and read/write scopes",
+    "grant/token revocation stops already-running containers",
+    "hard storage limits cover command/API writes and unlinked open files",
+    "real WebSocket PTY handles input/resize and runs as non-root",
+    "isolated app HTTP/WebSocket preview works, strips credentials, closes on stop; live deletion denied",
+    "explicit Deny removes all resource explanations/lists; only admin can restore archived shared space",
+    "built UI proxy supports real login and Cookie round trip without injecting an authenticated browser session"
+  ],
+  "testProcessesClosed": true
+}

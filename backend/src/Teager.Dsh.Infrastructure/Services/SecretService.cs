@@ -99,9 +99,34 @@ public partial class SecretService(DshDbContext db, IOptions<DshOptions> opt, Co
             (s.Scope == ConfigScope.Platform && s.ScopeId == "") || (s.Scope == ConfigScope.Pool && s.ScopeId == poolId) || (s.Scope == ConfigScope.Workspace && s.ScopeId == workspaceId)).ToListAsync();
         foreach (var s in rows.OrderBy(r => r.Scope)) // Platform → Pool → Workspace，后者覆盖前者
         {
-            try { env[s.Name] = Decrypt(s.ValueEncrypted); } catch (CryptographicException) { /* 主密钥变更后旧密文无法解密，跳过 */ }
+            try { env[s.Name] = Decrypt(s.ValueEncrypted); }
+            catch (Exception ex) when (ex is CryptographicException or FormatException or ArgumentException)
+            {
+                // A broken higher-scope credential must not fall back to a different key.
+                env.Remove(s.Name);
+            }
         }
         return env;
+    }
+
+    /// <summary>仅供可信模型代理获取密钥；区分缺失、空值和无法解密，不返回诊断密钥值。</summary>
+    public async Task<string> RequireModelKeyAsync(string poolId, string workspaceId, string name, IReadOnlyDictionary<string, string> env)
+    {
+        if (env.TryGetValue(name, out var value) && !string.IsNullOrEmpty(value)) return value;
+        var stored = await db.Secrets.AsNoTracking().Where(s => s.Name == name &&
+            ((s.Scope == ConfigScope.Platform && s.ScopeId == "") || (s.Scope == ConfigScope.Pool && s.ScopeId == poolId) || (s.Scope == ConfigScope.Workspace && s.ScopeId == workspaceId)))
+            .OrderByDescending(s => s.Scope).FirstOrDefaultAsync();
+        if (stored == null) throw ApiException.Conflict("模型引用的上游密钥尚未配置，请管理员在模型对应层级的密钥模块保存 API Key");
+        try
+        {
+            value = Decrypt(stored.ValueEncrypted);
+        }
+        catch (Exception ex) when (ex is CryptographicException or FormatException or ArgumentException)
+        {
+            throw ApiException.Conflict("模型密钥无法解密，请管理员恢复原密钥加密配置，或在模型对应层级的密钥模块重新保存 API Key");
+        }
+        if (string.IsNullOrEmpty(value)) throw ApiException.Conflict("模型密钥为空，请管理员在模型对应层级的密钥模块重新保存 API Key");
+        return value;
     }
 
     /// <summary>规范化层级 ID：平台层固定为空串。</summary>

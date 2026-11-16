@@ -55,7 +55,7 @@ public class RuntimeMaterializer(DshDbContext db, StoragePaths paths, Permission
         // 2) 有效配置 → Skill 文件 / 模型与 MCP 覆盖
         var effective = await config.ResolveAsync(pool.Id, ws.Id);
         WriteSkills(root, effective.Where(e => e.Kind == ConfigKind.Skill && e.Enabled).ToList());
-        var (patchFile, model) = WritePatch(pool.Id, ws.Id, effective, modelKey);
+        var (patchFile, model) = WritePatch(pool.Id, runId, effective, modelKey);
 
         // 3) 平台说明（Agent 会读取 AGENTS.md）
         WriteAgentsMd(root, ws, mounts, eff);
@@ -65,9 +65,10 @@ public class RuntimeMaterializer(DshDbContext db, StoragePaths paths, Permission
         env["DSH_PERMISSION_MODE"] = eff.SandboxMode;
         env["DSH_PLATFORM_WORKSPACE_ID"] = ws.Id;
         env["DSH_PLATFORM_NETWORK"] = eff.AllowNetwork ? "allow" : "deny";
+        if (model != null) env["DSH_SELECTED_MODEL"] = model;
 
         var timeoutMin = Math.Min(opt.Value.Runtime.RunTimeoutMinutes, eff.MaxRunMinutes > 0 ? eff.MaxRunMinutes : int.MaxValue);
-        var req = new RunRequest(runId, pool.Id, ws.Id, root, paths.PoolDshHome(pool.Id), runtimeSessionId, prompt, env, patchFile, TimeSpan.FromMinutes(Math.Max(1, timeoutMin)));
+        var req = new RunRequest(runId, pool.Id, ws.Id, root, paths.PoolDshHome(pool.Id), runtimeSessionId, prompt, env, patchFile, TimeSpan.FromMinutes(Math.Max(1, timeoutMin))) { ExecutionActor = actor, Mounts = mounts };
         return new RunPreparation(req, mounts, model);
     }
 
@@ -128,6 +129,7 @@ public class RuntimeMaterializer(DshDbContext db, StoragePaths paths, Permission
     {
         var rows = new List<object>();
         var models = effective.Where(e => e.Kind == ConfigKind.Model && e.Enabled).ToList();
+        if (!string.IsNullOrEmpty(requestedModel) && models.All(m => m.Key != requestedModel)) throw ApiException.Conflict("所选模型已不可用，请重新选择模型");
         var chosen = models.FirstOrDefault(m => m.Key == requestedModel) ?? models.FirstOrDefault(m => m.IsDefault) ?? models.FirstOrDefault();
         if (chosen != null)
         {
@@ -149,7 +151,13 @@ public class RuntimeMaterializer(DshDbContext db, StoragePaths paths, Permission
                     providers[g.Key] = new Dictionary<string, object?>
                     {
                         ["displayName"] = g.Key, ["apiKeyEnv"] = Str(first, "apiKeyEnv") ?? "OPENAI_API_KEY", ["api"] = Str(first, "api") ?? "openai-completions", ["baseURL"] = Str(first, "baseUrl"),
-                        ["models"] = g.Select(x => (object)new Dictionary<string, object?> { ["id"] = Str(x.p, "model") ?? x.m.Key, ["name"] = x.m.DisplayName ?? x.m.Key }).ToList()
+                        ["models"] = g.Select(x =>
+                        {
+                            var profile = new Dictionary<string, object?> { ["id"] = Str(x.p, "model") ?? x.m.Key, ["name"] = x.m.DisplayName ?? x.m.Key };
+                            var limits = ModelExecutionLimits.FromJson(x.m.ParamsJson);
+                            if (limits.ContextWindow > 0) profile["contextWindow"] = limits.ContextWindow;
+                            return (object)profile;
+                        }).ToList()
                     };
                 }
                 rows.Add(new Dictionary<string, object?> { ["id"] = "llm-pi-ai", ["name"] = "@deepseek-ai/dsh-llm-pi-ai", ["config"] = new Dictionary<string, object?> { ["providers"] = providers } });

@@ -42,6 +42,8 @@ public sealed class Actor
     public string Username { get; init; } = "";
     /// <summary>是否平台管理员。</summary>
     public bool IsPlatformAdmin { get; init; }
+    /// <summary>是否服务账号。服务账号不能当平台管理员。</summary>
+    public bool IsServiceAccount { get; init; }
     /// <summary>访问方式：web / token。</summary>
     public string Via { get; init; } = "web";
     /// <summary>Token ID（Web 登录为空）。</summary>
@@ -52,6 +54,8 @@ public sealed class Actor
     public HashSet<string> AllowedPools { get; init; } = [];
     /// <summary>Token 允许的 Workspace（空表示不限）。</summary>
     public HashSet<string> AllowedWorkspaces { get; init; } = [];
+    /// <summary>Token 允许的共享空间（空表示不限）。</summary>
+    public HashSet<string> AllowedSharedSpaces { get; init; } = [];
     /// <summary>来源 IP。</summary>
     public string? Ip { get; init; }
 
@@ -66,6 +70,14 @@ public sealed class Actor
     {
         if (!HasScope(scope)) throw ApiException.Forbidden($"Token 缺少所需 Scope：{scope}");
     }
+
+    /// <summary>要求当前主体是平台管理员，否则抛 403。</summary>
+    public void RequirePlatformAdmin()
+    {
+        if (!IsPlatformAdmin || IsServiceAccount || ResourceRestricted) throw ApiException.Forbidden("需要不受资源白名单限制的平台管理员权限");
+    }
+
+    public bool ResourceRestricted => AllowedPools.Count > 0 || AllowedWorkspaces.Count > 0 || AllowedSharedSpaces.Count > 0;
 
     /// <summary>Token 的 Pool 白名单是否放行（Web 登录始终放行）。</summary>
     /// <param name="poolId">Pool ID。</param>

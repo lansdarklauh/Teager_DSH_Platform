@@ -17,6 +17,7 @@ public class ConfigAccess(PermissionEngine engine)
     /// <param name="scopeId">层级对象 ID。</param>
     public async Task RequireManageAsync(Actor actor, ConfigScope scope, string scopeId)
     {
+        actor.RequirePlatformAdmin();
         switch (scope)
         {
             case ConfigScope.Platform: if (!actor.IsPlatformAdmin) throw ApiException.Forbidden("平台 / 组织级配置仅平台管理员可管理"); break;
@@ -31,6 +32,7 @@ public class ConfigAccess(PermissionEngine engine)
     /// <param name="scopeId">层级对象 ID。</param>
     public async Task RequireViewAsync(Actor actor, ConfigScope scope, string scopeId)
     {
+        if (scope == ConfigScope.Platform && actor.ResourceRestricted) throw ApiException.Forbidden("受限 Token 不可读取平台级配置");
         switch (scope)
         {
             case ConfigScope.Platform: break;
@@ -72,6 +74,7 @@ public partial class ConfigService(DshDbContext db, PermissionEngine engine, Con
     [GeneratedRegex("^[a-z0-9][a-z0-9-]{0,63}$")] private static partial Regex SkillKeyRegex();
     [GeneratedRegex("^[A-Za-z0-9_-]{1,32}$")] private static partial Regex McpKeyRegex();
     [GeneratedRegex("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")] private static partial Regex PluginKeyRegex();
+    [GeneratedRegex("^[A-Za-z_][A-Za-z0-9_]{0,63}$")] private static partial Regex EnvironmentNameRegex();
 
     /// <summary>列出某层级自身定义的配置项。</summary>
     /// <param name="actor">操作者。</param>
@@ -250,7 +253,7 @@ public partial class ConfigService(DshDbContext db, PermissionEngine engine, Con
         try { using var d = JsonDocument.Parse(it.ParamsJson); return d.RootElement.TryGetProperty("isDefault", out var v) && v.ValueKind == JsonValueKind.True; } catch { return false; }
     }
 
-    /// <summary>以上级参数为基础，仅合并下级提交的 isDefault 标记。</summary>
+    /// <summary>保留上级模型连接参数，合并管理员在下级声明的默认选择和执行限制。</summary>
     /// <param name="baseJson">上级参数。</param>
     /// <param name="overrideJson">下级提交的参数。</param>
     private static string? MergeDefaultFlag(string? baseJson, string? overrideJson)
@@ -261,6 +264,16 @@ public partial class ConfigService(DshDbContext db, PermissionEngine engine, Con
         if (!string.IsNullOrWhiteSpace(overrideJson)) try { using var d = JsonDocument.Parse(overrideJson); isDef = d.RootElement.TryGetProperty("isDefault", out var v) && v.ValueKind == JsonValueKind.True; } catch { }
         var o = dict.ToDictionary(kv => kv.Key, kv => (object?)kv.Value);
         o["isDefault"] = isDef;
+        if (!string.IsNullOrWhiteSpace(overrideJson))
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(overrideJson);
+                foreach (var field in new[] { "taskBudget", "contextWindow" })
+                    if (document.RootElement.ValueKind == JsonValueKind.Object && document.RootElement.TryGetProperty(field, out var value)) o[field] = value.Clone();
+            }
+            catch (JsonException) { /* Legacy invalid JSON must not break configuration resolution. */ }
+        }
         return JsonSerializer.Serialize(o);
     }
 
@@ -292,6 +305,10 @@ public partial class ConfigService(DshDbContext db, PermissionEngine engine, Con
         JsonElement root;
         try { root = JsonDocument.Parse(json).RootElement.Clone(); } catch { throw ApiException.BadRequest("参数不是合法的 JSON"); }
         if (root.ValueKind != JsonValueKind.Object) throw ApiException.BadRequest("参数必须是 JSON 对象");
+        if (kind == ConfigKind.Model) ModelExecutionLimits.FromElement(root);
+        if (kind == ConfigKind.Model && root.TryGetProperty("apiKeyEnv", out var keyName)
+            && (keyName.ValueKind != JsonValueKind.String || !EnvironmentNameRegex().IsMatch(keyName.GetString() ?? "")))
+            throw ApiException.BadRequest("apiKeyEnv 必须填写密钥名称（例如 MINIMAX_API_KEY），不能填写密钥值；请在同层级的密钥模块保存密钥");
         if (kind == ConfigKind.Plugin && !(root.TryGetProperty("package", out var pkg) && !string.IsNullOrWhiteSpace(pkg.GetString()))) throw ApiException.BadRequest("插件必须配置 package（插件包名）");
         if (kind == ConfigKind.Mcp)
         {

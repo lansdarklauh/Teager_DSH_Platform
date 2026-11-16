@@ -2,7 +2,8 @@
 import { onMounted, ref } from 'vue'
 import { message } from 'ant-design-vue'
 import { TeamOutlined, PlusOutlined, KeyOutlined } from '@ant-design/icons-vue'
-import { userApi } from '@/api'
+import { http } from '@/api/http'
+import { userApi, wsApi } from '@/api'
 import { fmtAgo } from '@/utils/format'
 import PageHeader from '@/components/PageHeader.vue'
 
@@ -14,6 +15,15 @@ const form = ref<any>({})
 const saving = ref(false)
 const edit = ref<any>({ open: false })
 const pwd = ref<any>({ open: false, id: '', name: '', value: '' })
+const assignment = ref<any>({ open: false })
+const workspaces = ref<any[]>([])
+async function assign(r: any) {
+  const [spaces, users] = await Promise.all([wsApi.list(), userApi.list()]) as [any[], any[]]
+  const occupied = new Set(users.filter(u => u.id !== r.id && u.defaultWorkspaceId).map(u => u.defaultWorkspaceId))
+  workspaces.value = spaces.filter(w => !occupied.has(w.id))
+  assignment.value = { open: true, id: r.id, workspaceId: users.find(u => u.id === r.id)?.defaultWorkspaceId }
+}
+async function saveAssignment() { await http.put(`/users/${assignment.value.id}/workspace`, { workspaceId: assignment.value.workspaceId }); assignment.value.open = false; message.success('个人工作空间已分配'); await load() }
 async function load() { loading.value = true; try { rows.value = (await userApi.list(keyword.value)) as any[] } finally { loading.value = false } }
 onMounted(load)
 function blank() { return { username: '', displayName: '', email: '', password: '', role: 'User', isServiceAccount: false } }
@@ -37,7 +47,7 @@ async function resetPwd() { await userApi.resetPassword(pwd.value.id, pwd.value.
         <a-table-column title="平台角色" key="r" :width="120"><template #default="{ record }"><span class="tag" :class="record.role === 'Admin' ? 'audit' : ''">{{ record.role === 'Admin' ? '平台管理员' : '普通用户' }}</span></template></a-table-column>
         <a-table-column title="状态" key="s" :width="100"><template #default="{ record }"><span class="tag dot" :class="record.status === 'Active' ? 'ok' : 'danger'">{{ record.status === 'Active' ? '正常' : '已禁用' }}</span></template></a-table-column>
         <a-table-column title="最近登录" key="l" :width="130"><template #default="{ record }"><span class="muted">{{ fmtAgo(record.lastLoginAt) }}</span></template></a-table-column>
-        <a-table-column title="操作" key="op" :width="190" align="right"><template #default="{ record }"><a-space :size="4"><a-button type="text" size="small" @click="edit = { open: true, ...record }">编辑</a-button><a-button v-if="!record.isServiceAccount" type="text" size="small" @click="pwd = { open: true, id: record.id, name: record.displayName, value: '' }"><KeyOutlined /> 重置密码</a-button></a-space></template></a-table-column>
+        <a-table-column title="操作" key="op" :width="190" align="right"><template #default="{ record }"><a-space :size="4"><a-button type="text" size="small" @click="edit = { open: true, ...record }">编辑</a-button><a-button v-if="record.role !== 'Admin' && !record.isServiceAccount" type="text" size="small" @click="assign(record)">分配工作空间</a-button><a-button v-if="!record.isServiceAccount" type="text" size="small" @click="pwd = { open: true, id: record.id, name: record.displayName, value: '' }"><KeyOutlined /> 重置密码</a-button></a-space></template></a-table-column>
       </a-table>
     </div>
 
@@ -62,6 +72,7 @@ async function resetPwd() { await userApi.resetPassword(pwd.value.id, pwd.value.
         <a-form-item label="状态"><a-radio-group v-model:value="edit.status"><a-radio value="Active">正常</a-radio><a-radio value="Disabled">禁用（立即退出登录并使 Token 失效）</a-radio></a-radio-group></a-form-item>
       </a-form>
     </a-modal>
+    <a-modal v-model:open="assignment.open" title="分配个人工作空间" ok-text="分配" cancel-text="取消" @ok="saveAssignment"><a-alert type="info" message="分配后旧空间访问立即失效；不能分配已属于其他用户的空间。" style="margin-bottom: 16px" /><a-select v-model:value="assignment.workspaceId" :options="workspaces.map(w => ({ value: w.id, label: w.name }))" style="width: 100%" /></a-modal>
     <a-modal v-model:open="pwd.open" :title="`重置「${pwd.name}」的密码`" ok-text="重置" cancel-text="取消" @ok="resetPwd"><a-input-password v-model:value="pwd.value" placeholder="新密码（至少 8 位，含字母和数字）" autocomplete="new-password" /></a-modal>
   </div>
 </template>

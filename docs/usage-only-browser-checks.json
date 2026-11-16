@@ -1,0 +1,47 @@
+{
+  "date": "2026-10-08",
+  "browser": "Edge",
+  "checks": [
+    "wrong password rejected on real login page",
+    "ordinary login lands directly on its personal workbench with projects, conversation and default file panel",
+    "@ Chinese project search and Enter selection create a removable tag without sending",
+    "Shift+Enter inserts a newline without sending",
+    "real browser message creates a session, streams a Mock reply with project context, renders history tag and clears draft",
+    "project tag and messages survive a real page reload",
+    "project card adds a reference and its close icon removes the draft tag",
+    "ordinary user creates a project with Chinese name and description through the actual form",
+    "project open-files, Chinese file preview/edit/save and reopen round trip",
+    "personal file panel creates and renames Chinese directories",
+    "personal file delete confirmation removes the temporary empty directory",
+    "real process panel command completes with uid=1000 and writes personal file",
+    "real browser PTY connects, accepts commands, runs non-root and shares process-written personal file",
+    "ordinary API page shows personal workspace IDs, Python/curl/file/command/project reference guidance and no admin navigation",
+    "ordinary Token UI constrains workspace/scope, shows plaintext only once, then revokes token",
+    "ordinary shared list has no create control; RO detail has no manage/upload/rename/delete controls and preview is read-only",
+    "logout clears identity and returns to login",
+    "admin login exposes Pool/workspace/shared/user/runtime/config/audit management entries",
+    "admin UI updates alice shared grant from RO to RW",
+    "backend rejects assigning bobs existing personal workspace to alice",
+    "rebuilt admin assignment selector excludes workspaces occupied by another user",
+    "rebuilt workbench instructions and suggestions use the personal/project file area without files/shared path ambiguity",
+    "admin-assigned RW permits ordinary shared file editing through its workbench",
+    "ordinary direct navigation to /users redirects to its personal workbench",
+    "foreign personal workbench URL redirects to current users own workspace",
+    "explicit Pool details editor can save description but has no member/policy/runtime/resource management controls",
+    "ordinary UI starts HTTP application, isolated preview renders directory and personal command-written file",
+    "UI stop action changes temporary application from Running to Stopped"
+  ],
+  "passed": 28,
+  "proofPaths": [
+    "initial-workbench.png",
+    "shared-readonly.png",
+    "admin-home.png",
+    "assignment-filter.png",
+    "app-preview.png"
+  ],
+  "unfinished": [
+    "native upload chooser blocked: cannot determine current Windows browser URL",
+    "download button and Bob login GUI not yet verified"
+  ],
+  "testTool": "Browser AX, no Playwright"
+}

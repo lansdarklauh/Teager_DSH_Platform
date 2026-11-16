@@ -27,7 +27,12 @@ public record RuntimeHealth(bool Healthy, string? Version, string? Message, int 
 /// <param name="PatchFile">DSH 配置覆盖文件路径（模型 / MCP）。</param>
 /// <param name="Timeout">最长运行时间。</param>
 public record RunRequest(string RunId, string PoolId, string WorkspaceId, string WorkspaceRoot, string DshHome, string? RuntimeSessionId, string Prompt,
-    IReadOnlyDictionary<string, string> Env, string? PatchFile, TimeSpan Timeout);
+    IReadOnlyDictionary<string, string> Env, string? PatchFile, TimeSpan Timeout)
+{
+    public Teager.Dsh.Infrastructure.Common.Actor? ExecutionActor { get; init; }
+    public IReadOnlyList<ActiveMount> Mounts { get; init; } = [];
+    public long ModelBudget { get; init; }
+}
 
 /// <summary>终端打开请求。</summary>
 /// <param name="WorkspaceRoot">工作目录。</param>

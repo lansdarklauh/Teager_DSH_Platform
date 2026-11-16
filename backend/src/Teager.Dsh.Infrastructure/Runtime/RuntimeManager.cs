@@ -18,7 +18,7 @@ public class RuntimeState
     public ConcurrentDictionary<string, (string PoolId, string SessionId, CancellationTokenSource Cts)> Runs { get; } = new();
 
     /// <summary>获取 Pool 的互斥锁。</summary>
-    /// <param name="poolId">Pool ID。</param>
+    public ConcurrentDictionary<string, SemaphoreSlim> RecordLocks { get; } = new();
     public SemaphoreSlim LockFor(string poolId) => Locks.GetOrAdd(poolId, _ => new SemaphoreSlim(1, 1));
     /// <summary>某 Pool 当前运行中的任务数。</summary>
     /// <param name="poolId">Pool ID。</param>
@@ -40,6 +40,10 @@ public class RuntimeManager(DshDbContext db, IEnumerable<IRuntimeProvider> provi
     /// <param name="pool">Pool。</param>
     public async Task<RuntimeInstance> GetOrCreateAsync(Pool pool)
     {
+        var gate = state.RecordLocks.GetOrAdd(pool.Id, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync();
+        try
+        {
         var rt = await db.Runtimes.FirstOrDefaultAsync(r => r.PoolId == pool.Id);
         if (rt != null) return rt;
         var node = await db.RuntimeNodes.OrderBy(n => n.CreatedAt).Select(n => n.Id).FirstOrDefaultAsync() ?? "local";
@@ -47,6 +51,9 @@ public class RuntimeManager(DshDbContext db, IEnumerable<IRuntimeProvider> provi
         db.Runtimes.Add(rt);
         await db.SaveChangesAsync();
         return rt;
+        }
+        finally { gate.Release(); }
+
     }
 
     /// <summary>确保 Runtime 已启动（未运行则启动）；处于维护模式时拒绝。</summary>
@@ -72,6 +79,7 @@ public class RuntimeManager(DshDbContext db, IEnumerable<IRuntimeProvider> provi
         try
         {
             await db.Entry(rt).ReloadAsync();
+            if (rt.Status == RuntimeStatus.MAINTENANCE) throw ApiException.Conflict("Runtime 正在维护中");
             if (rt.Status is RuntimeStatus.RUNNING or RuntimeStatus.IDLE) return rt;
             rt.Status = RuntimeStatus.STARTING; rt.Provider = pool.RuntimeProvider; await db.SaveChangesAsync();
             var health = await Provider(rt.Provider).StartRuntimeAsync(new RuntimeSpec(pool.Id, paths.PoolDshHome(pool.Id)), CancellationToken.None);
@@ -117,10 +125,17 @@ public class RuntimeManager(DshDbContext db, IEnumerable<IRuntimeProvider> provi
     public async Task<RuntimeInstance> SetMaintenanceAsync(Pool pool, bool enabled)
     {
         var rt = await GetOrCreateAsync(pool);
+        var gate = state.LockFor(pool.Id); await gate.WaitAsync();
+        try
+        {
+            await db.Entry(rt).ReloadAsync();
         if (enabled) rt.Status = RuntimeStatus.MAINTENANCE;
         else if (rt.Status == RuntimeStatus.MAINTENANCE) rt.Status = RuntimeStatus.STOPPED;
         await db.SaveChangesAsync();
         return rt;
+        }
+        finally { gate.Release(); }
+
     }
 
     /// <summary>健康检查：调用 Provider 并刷新记录。</summary>

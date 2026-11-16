@@ -37,10 +37,10 @@ public class PermissionTests
         // C1（集团公共，RO 向下继承）：所有人 RO
         foreach (var u in new[] { sc.UA, sc.UB, sc.UC, sc.UD, sc.UE }) Assert.Equal("RO", await Perm(sc, u, sc.C1));
         // A1（编辑内部，不继承）：仅 A、B
-        Assert.Equal("RW", await Perm(sc, sc.UA, sc.A1)); Assert.Equal("RW", await Perm(sc, sc.UB, sc.A1));
+        Assert.Equal("RO", await Perm(sc, sc.UA, sc.A1)); Assert.Equal("RO", await Perm(sc, sc.UB, sc.A1));
         Assert.Null(await Perm(sc, sc.UC, sc.A1)); Assert.Null(await Perm(sc, sc.UD, sc.A1)); Assert.Null(await Perm(sc, sc.UE, sc.A1));
         // B1（市场内部）：仅 C、D
-        Assert.Equal("RW", await Perm(sc, sc.UC, sc.B1)); Assert.Equal("RW", await Perm(sc, sc.UD, sc.B1));
+        Assert.Equal("RO", await Perm(sc, sc.UC, sc.B1)); Assert.Equal("RO", await Perm(sc, sc.UD, sc.B1));
         Assert.Null(await Perm(sc, sc.UA, sc.B1)); Assert.Null(await Perm(sc, sc.UB, sc.B1)); Assert.Null(await Perm(sc, sc.UE, sc.B1));
     }
 
@@ -61,7 +61,7 @@ public class PermissionTests
     {
         var sc = await BuildAsync(); await using var _ = sc.Env;
         var only = await sc.Env.SpaceAsync("仅集团直属", sc.C, sc.C, SharePermission.RW, false);
-        Assert.Equal("RW", await Perm(sc, sc.UE, only));   // 直属 C
+        Assert.Equal("RO", await Perm(sc, sc.UE, only));   // 直属 C
         Assert.Null(await Perm(sc, sc.UA, only));          // 通过子 Pool 间接属于 C，不继承
     }
 
@@ -85,6 +85,7 @@ public class PermissionTests
     public async Task User_Grant_Overrides_Pool_Grant()
     {
         var sc = await BuildAsync(); await using var _ = sc.Env;
+        await sc.Env.Get<SharedSpaceService>().UpsertGrantAsync(sc.Env.Admin, sc.A1.Id, GrantSubjectType.USER, sc.UA.UserId, SharePermission.RW, GrantEffect.Allow, false);
         await sc.Env.Get<SharedSpaceService>().UpsertGrantAsync(sc.Env.Admin, sc.A1.Id, GrantSubjectType.USER, sc.UB.UserId, SharePermission.RO, GrantEffect.Allow, false);
         Assert.Equal("RO", await Perm(sc, sc.UB, sc.A1));
         Assert.Equal("RW", await Perm(sc, sc.UA, sc.A1));
@@ -96,29 +97,20 @@ public class PermissionTests
     {
         var sc = await BuildAsync(); await using var _ = sc.Env;
         var wsSvc = sc.Env.Get<WorkspaceService>();
-        // 在集团 C 下创建 Workspace：E（直属 C）可进；A（通过子 Pool 有效成员）继承进入且角色封顶 Member
         var admin = sc.Env.Admin;
         var ws = await wsSvc.CreateAsync(admin, sc.C.Id, "集团工作台", null);
-        var wa = await sc.Env.Engine.GetWorkspaceAccessAsync(sc.UE, ws);
-        Assert.Equal(WorkspaceRole.Member, wa.Role); Assert.Equal("pool-direct", wa.Source);
-        var wa2 = await sc.Env.Engine.GetWorkspaceAccessAsync(sc.UA, ws);
-        Assert.Equal("pool-inherited", wa2.Source); Assert.Equal(WorkspaceRole.Member, wa2.Role); // A 在 Pool A 是 Admin，继承后封顶 Member
-        // 不继承 Pool 成员：A、E 均无权
-        await wsSvc.UpdateAsync(admin, ws.Id, null, null, false);
-        sc.Env.Db.ChangeTracker.Clear();
-        var fresh = await sc.Env.Db.Workspaces.FirstAsync(w => w.Id == ws.Id);
-        Assert.Null((await sc.Env.Engine.GetWorkspaceAccessAsync(sc.UA, fresh)).Role);
-        Assert.Null((await sc.Env.Engine.GetWorkspaceAccessAsync(sc.UE, fresh)).Role);
-        // 显式授权后可进；显式拒绝优先
-        await wsSvc.UpsertMemberAsync(admin, ws.Id, sc.UA.UserId, WorkspaceRole.Viewer, GrantEffect.Allow);
-        Assert.Equal(WorkspaceRole.Viewer, (await sc.Env.Engine.GetWorkspaceAccessAsync(sc.UA, fresh)).Role);
+        Assert.Null((await sc.Env.Engine.GetWorkspaceAccessAsync(sc.UE, ws)).Role);
+        Assert.Null((await sc.Env.Engine.GetWorkspaceAccessAsync(sc.UA, ws)).Role);
+        await wsSvc.UpsertMemberAsync(admin, ws.Id, sc.UA.UserId, WorkspaceRole.Owner, GrantEffect.Allow);
+        Assert.Null((await sc.Env.Engine.GetWorkspaceAccessAsync(sc.UA, ws)).Role); // legacy Owner is insufficient
+        await sc.Env.Get<PersonalWorkspaceService>().AssignAsync(admin, sc.UA.UserId, ws.Id);
+        var wa = await sc.Env.Engine.GetWorkspaceAccessAsync(sc.UA, ws);
+        Assert.Equal(WorkspaceRole.Member, wa.Role); Assert.False(await sc.Env.Engine.CanManageWorkspaceAsync(sc.UA, ws, wa));
+        Assert.Null((await sc.Env.Engine.GetWorkspaceAccessAsync(sc.UE, ws)).Role);
         await wsSvc.UpsertMemberAsync(admin, ws.Id, sc.UA.UserId, WorkspaceRole.Member, GrantEffect.Deny);
-        var denied = await sc.Env.Engine.GetWorkspaceAccessAsync(sc.UA, fresh);
+        var denied = await sc.Env.Engine.GetWorkspaceAccessAsync(sc.UA, ws);
         Assert.True(denied.Denied); Assert.Null(denied.Role);
-        // 兄弟 Pool 的成员无权访问 Pool A 的 Workspace
-        var wsA = await wsSvc.CreateAsync(admin, sc.A.Id, "编辑工作台", null);
-        Assert.Null((await sc.Env.Engine.GetWorkspaceAccessAsync(sc.UC, wsA)).Role);
-        Assert.Equal(WorkspaceRole.Member, (await sc.Env.Engine.GetWorkspaceAccessAsync(sc.UB, wsA)).Role);
+
     }
 
     /// <summary>挂载：权限 ≠ 挂载；覆盖只能降低不能扩大；未授权的空间不可挂载（方案第 20、58 节）。</summary>
@@ -128,6 +120,7 @@ public class PermissionTests
         var sc = await BuildAsync(); await using var _ = sc.Env;
         var wsSvc = sc.Env.Get<WorkspaceService>(); var admin = sc.Env.Admin;
         var ws = await wsSvc.CreateAsync(admin, sc.A.Id, "编辑工作台", null);
+        await sc.Env.Get<PersonalWorkspaceService>().AssignAsync(admin, sc.UA.UserId, ws.Id);
         // Pool A 未获授权的 B1 不能挂载
         await Assert.ThrowsAsync<ApiException>(() => wsSvc.AddMountAsync(admin, ws.Id, sc.B1.Id, null, null));
         // C1（RO 继承）可挂载，覆盖不能提升为 RW
@@ -140,7 +133,7 @@ public class PermissionTests
         Assert.Contains("\"EffectivePermission\":\"RO\"", json);
         // 未挂载 ≠ 有权限：授权仍在，但没有挂载记录时不会出现在 mounts 中，而在 available 中
         var ws2 = await wsSvc.CreateAsync(admin, sc.A.Id, "另一个工作台", null);
-        var (m2, avail) = await wsSvc.ListMountsAsync(sc.UA, ws2, await sc.Env.Engine.GetWorkspaceAccessAsync(sc.UA, ws2));
+        var (m2, avail) = await wsSvc.ListMountsAsync(admin, ws2, await sc.Env.Engine.GetWorkspaceAccessAsync(admin, ws2));
         Assert.Empty(m2); Assert.Equal(2, avail.Count);
     }
 
@@ -160,7 +153,7 @@ public class PermissionTests
         var mount = await sc.Env.Db.WorkspaceSharedSpaceMounts.FirstAsync(m => m.WorkspaceId == ws.Id);
         // Pool 授权按 Workspace 所属 Pool 计算（RW），但 Viewer 角色封顶 RO
         var acc = await sc.Env.Engine.GetWorkspaceSpaceAccessAsync(viewer, ws, wa, space, mount);
-        Assert.Equal(SharePermission.RO, acc.Permission);
+        Assert.Null(acc.Permission);
     }
 
     /// <summary>权限缓存：变更成员后立即生效（缓存失效，方案第 71 节）。</summary>
@@ -170,7 +163,7 @@ public class PermissionTests
         var sc = await BuildAsync(); await using var _ = sc.Env;
         Assert.Null(await Perm(sc, sc.UE, sc.A1));
         await sc.Env.JoinAsync(sc.A, sc.UE);   // E 加入 Pool A
-        Assert.Equal("RW", await Perm(sc, sc.UE, sc.A1));
+        Assert.Equal("RO", await Perm(sc, sc.UE, sc.A1));
         await sc.Env.Get<PoolService>().RemoveMemberAsync(sc.Env.Admin, sc.A.Id, sc.UE.UserId);
         Assert.Null(await Perm(sc, sc.UE, sc.A1));
     }
@@ -183,7 +176,7 @@ public class PermissionTests
         var boss = await sc.Env.UserAsync("boss");
         await sc.Env.JoinAsync(sc.C, boss, PoolRole.Admin);
         var access = await sc.Env.Engine.GetPoolAccessAsync(boss, sc.A.Id);
-        Assert.True(access.CanManage); Assert.Equal("ancestor-admin", access.Source);
+        Assert.False(access.CanManage); Assert.Equal("ancestor-member", access.Source);
         // 但没有 A1（编辑内部资料）的数据访问权：不是 A 的成员，也没有授权
         var a1 = await sc.Env.Db.SharedSpaces.FirstAsync(s => s.Id == sc.A1.Id);
         var acc = await sc.Env.Engine.GetUserSpaceAccessAsync(boss, a1);
@@ -200,6 +193,7 @@ public class PermissionTests
         var sc = await BuildAsync(); await using var _ = sc.Env;
         var wsSvc = sc.Env.Get<WorkspaceService>();
         var w1 = await wsSvc.CreateAsync(sc.Env.Admin, sc.A.Id, "w1", null); var w2 = await wsSvc.CreateAsync(sc.Env.Admin, sc.A.Id, "w2", null);
+        await sc.Env.Get<PersonalWorkspaceService>().AssignAsync(sc.Env.Admin, sc.UA.UserId, w1.Id);
         var token = new Actor { UserId = sc.UA.UserId, Username = "a", Via = "token", Scopes = [Scopes.WorkspaceRead], AllowedWorkspaces = [w1.Id] }; // A 是 Pool A 的 Admin
         var list = await wsSvc.ListAsync(token, null, false);
         Assert.Equal(new[] { w1.Id }, list.Select(v => v.Workspace.Id).ToArray());

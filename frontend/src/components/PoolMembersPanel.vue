@@ -2,6 +2,7 @@
 import { ref, watch } from 'vue'
 import { message, Modal } from 'ant-design-vue'
 import { PlusOutlined, DeleteOutlined } from '@ant-design/icons-vue'
+import { http } from '@/api/http'
 import { poolApi } from '@/api'
 import { fmtAgo } from '@/utils/format'
 import Tags from './Tags.vue'
@@ -21,6 +22,7 @@ async function add() {
   if (!form.value.userId) { message.warning('请选择用户'); return }
   await poolApi.addMember(props.poolId, form.value.userId, form.value.role); message.success('成员已添加'); open.value = false; form.value = { userId: undefined, role: 'Member' }; load()
 }
+async function details(r: any, value: boolean) { await http.put(`/pools/${props.poolId}/members/${r.userId}/details-permission`, { canEditDetails: value }); await load() }
 async function changeRole(r: any, role: string) { await poolApi.setRole(props.poolId, r.userId, role); message.success('角色已更新'); load() }
 function remove(r: any) {
   Modal.confirm({ title: `移除成员「${r.displayName}」？`, content: '移除后其在本 Pool 及其子 Pool 的继承权限将立即失效。', okType: 'danger', okText: '移除', cancelText: '取消', onOk: async () => { await poolApi.removeMember(props.poolId, r.userId); load() } })
@@ -39,6 +41,7 @@ function remove(r: any) {
             <Tags v-else kind="role" :value="record.role" />
           </template>
         </a-table-column>
+        <a-table-column v-if="canManage" title="名称/描述编辑权" key="details"><template #default="{ record }"><a-switch :checked="record.canEditDetails" @change="(value: any) => details(record, value)" /></template></a-table-column>
         <a-table-column title="加入时间" key="t" :width="140"><template #default="{ record }"><span class="muted">{{ fmtAgo(record.createdAt) }}</span></template></a-table-column>
         <a-table-column v-if="canManage" title="操作" key="op" :width="80" align="right"><template #default="{ record }"><a-button type="text" size="small" danger @click="remove(record)"><DeleteOutlined /></a-button></template></a-table-column>
       </a-table>

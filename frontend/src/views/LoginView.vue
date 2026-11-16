@@ -16,7 +16,8 @@ async function submit() {
   loading.value = true; error.value = ''
   try {
     await auth.login(form.value.username.trim(), form.value.password)
-    router.replace((route.query.redirect as string) || '/app')
+    const redirect = route.query.redirect as string
+    router.replace(!auth.isAdmin ? auth.landingPath : redirect?.startsWith('/') && !redirect.startsWith('//') ? redirect : auth.landingPath)
   } catch (e: any) {
     error.value = e.response?.status === 429 ? '登录尝试过于频繁，请稍后再试' : (e.friendly || '登录失败')
   } finally { loading.value = false }

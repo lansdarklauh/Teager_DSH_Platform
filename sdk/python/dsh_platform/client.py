@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -252,38 +253,63 @@ class Session:
         self._c = client
         self.id = session_id
 
-    def send(self, content: str, model: Optional[str] = None, timeout: float = 1900.0) -> Result:
+    def send(self, content: str, model: Optional[str] = None, timeout: float = 1900.0, request_id: Optional[str] = None, project_ids: Optional[list[str]] = None) -> Result:
         """发送消息并同步等待最终结果（对应 ``POST /sessions/{id}/messages?wait=true``）。"""
-        r = self._c._request("POST", f"/sessions/{self.id}/messages", body={"content": content, "model": model}, params={"wait": "true"}, timeout=timeout)
+        r = self._c._request("POST", f"/sessions/{self.id}/messages", body={"content": content, "model": model, "requestId": request_id or str(uuid.uuid4()), "projectIds": project_ids}, params={"wait": "true"}, timeout=timeout)
         return Result(text=r.get("text") or "", status=r.get("status") or "", run_id=r.get("runId"), input_tokens=r.get("inputTokens") or 0,
                       output_tokens=r.get("outputTokens") or 0, duration_ms=r.get("durationMs") or 0, error=r.get("error"), raw=r)
 
-    def stream(self, content: str, model: Optional[str] = None, timeout: float = 1900.0) -> Iterator[dict]:
+    def stream(self, content: str, model: Optional[str] = None, timeout: float = 1900.0, project_ids: Optional[list[str]] = None) -> Iterator[dict]:
         """发送消息并流式返回事件（SSE）：事件含 type = text / thinking / tool_call / tool_result / status / final / run_end 等。"""
         after = self._c._request("GET", f"/sessions/{self.id}")["lastEventSeq"]
-        self._c._request("POST", f"/sessions/{self.id}/messages", body={"content": content, "model": model})
-        yield from self.events(after=after, timeout=timeout)
+        result = self._c._request("POST", f"/sessions/{self.id}/messages", body={"content": content, "model": model, "requestId": str(uuid.uuid4()), "projectIds": project_ids})
+        yield from self.events(after=after, timeout=timeout, run_id=result['runId'])
 
-    def events(self, after: int = 0, timeout: float = 1900.0) -> Iterator[dict]:
-        """订阅会话事件流（先回放 seq > after 的历史，再跟随，run_end 后结束）。"""
-        url = f"{self._c.base_url}/api/v1/sessions/{self.id}/events?after={after}"
-        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {self._c.token}", "Accept": "text/event-stream"})
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                data: list = []
-                for raw in r:
-                    line = raw.decode("utf-8").rstrip("\n")
-                    if line.startswith("data: "):
-                        data.append(line[6:])
-                    elif line == "" and data:
-                        yield json.loads("\n".join(data))
-                        data = []
-        except urllib.error.HTTPError as e:
-            raise DshError(e.code, "error", e.read().decode("utf-8", "replace")[:300]) from None
+    def events(self, after: int = 0, timeout: float = 1900.0, run_id: Optional[str] = None) -> Iterator[dict]:
+        """订阅事件；按 seq 去重，指定运行时断线续接并过滤其他运行。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            url = f"{self._c.base_url}/api/v1/sessions/{self.id}/events?after={after}"
+            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {self._c.token}", "Accept": "text/event-stream"})
+            try:
+                with urllib.request.urlopen(req, timeout=min(60, max(.1, deadline - time.monotonic()))) as r:
+                    data: list = []
+                    for raw in r:
+                        if time.monotonic() >= deadline:
+                            raise DshError(504, "stream_timeout", "等待事件超时，任务仍可在后台运行")
+                        line = raw.decode("utf-8").rstrip("\r\n")
+                        if line.startswith("data: "):
+                            data.append(line[6:])
+                        elif line == "" and data:
+                            event = json.loads("\n".join(data)); data = []
+                            sequence = event.get('seq', 0)
+                            if sequence <= after:
+                                continue
+                            after = sequence
+                            if run_id and event.get('runId') != run_id:
+                                continue
+                            yield event
+                            if event.get('type') == 'run_end':
+                                return
+                if run_id is None:
+                    return
+            except urllib.error.HTTPError as e:
+                raise DshError(e.code, "error", e.read().decode("utf-8", "replace")[:300]) from None
+            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+                if run_id is None:
+                    raise
+            time.sleep(min(.5, max(0, deadline - time.monotonic())))
+        raise DshError(504, "stream_timeout", "等待事件超时，任务仍可在后台运行")
 
     def messages(self) -> list:
-        """消息列表（文本摘要）。"""
-        return self._c._request("GET", f"/sessions/{self.id}/messages")
+        """消息列表，按游标读取完整历史（文本摘要）。"""
+        rows, after = [], 0
+        while True:
+            page = self._c._request("GET", f"/sessions/{self.id}/messages", params={"after": after, "limit": 500})
+            rows.extend(page)
+            if len(page) < 500:
+                return rows
+            after = page[-1]['id']
 
     def cancel(self) -> bool:
         """取消正在运行的任务。"""

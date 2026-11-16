@@ -9,9 +9,9 @@ import { fmtBytes, fmtShort } from '@/utils/format'
  * 文件管理器：Workspace 私有文件 / 挂载的共享空间 / 直接访问共享空间共用。
  * areas 用于在“私有文件 / 各共享挂载”之间切换；只读区域会隐藏写操作。
  */
-const props = defineProps<{ base: string; areas?: { value: string; label: string; hint?: string }[]; canWrite?: boolean }>()
+const props = defineProps<{ base: string; areas?: { value: string; label: string; hint?: string }[]; canWrite?: boolean; initialPath?: string }>()
 const area = ref<string | undefined>(props.areas?.[0]?.value)
-const path = ref('')
+const path = ref(props.initialPath || '')
 const entries = ref<any[]>([])
 const writable = ref(false)
 const loading = ref(false)
@@ -26,7 +26,8 @@ async function load() {
   } catch { entries.value = []; writable.value = false } finally { loading.value = false }
 }
 watch(() => [props.base, props.areas?.map((a) => a.value).join(',')], () => { if (!props.areas?.some((a) => a.value === area.value)) area.value = props.areas?.[0]?.value; path.value = ''; load() })
-watch(area, () => { path.value = ''; load() })
+watch(() => props.initialPath, (value) => { area.value = props.areas?.[0]?.value; path.value = value || ''; load() })
+watch(area, () => { path.value = ''; load() }, { flush: 'sync' })
 watch(path, load, { immediate: true })
 
 function open(e: any) { if (e.isDir) path.value = e.path; else preview(e) }

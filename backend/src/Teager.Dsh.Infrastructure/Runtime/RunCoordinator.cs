@@ -21,7 +21,10 @@ namespace Teager.Dsh.Infrastructure.Runtime;
 /// <param name="Actor">发起人。</param>
 /// <param name="Prompt">用户输入。</param>
 /// <param name="ModelKey">请求的模型键。</param>
-public record RunJob(string RunId, string SessionId, Actor Actor, string Prompt, string? ModelKey);
+public record RunJob(string RunId, string SessionId, Actor Actor, string Prompt, string? ModelKey)
+{
+    public IReadOnlyList<ProjectReference> Projects { get; init; } = [];
+}
 
 /// <summary>
 /// 运行协调器（单例）：在后台执行 Agent 运行——启动 Runtime、物化环境、消费 Provider 事件流、写事件日志、
@@ -39,7 +42,7 @@ public class RunCoordinator(IServiceScopeFactory scopes, RuntimeState state, Ses
         _ = Task.Run(async () =>
         {
             try { await ExecuteAsync(job, cts); }
-            catch (Exception ex) { logger.LogError(ex, "运行 {RunId} 执行器异常", job.RunId); }
+            catch (Exception ex) { logger.LogError(ex, "运行 {RunId} 执行器异常", job.RunId); await RecoverAsync(job.RunId); }
             finally { state.Runs.TryRemove(job.RunId, out _); cts.Dispose(); }
         });
     }
@@ -75,21 +78,30 @@ public class RunCoordinator(IServiceScopeFactory scopes, RuntimeState state, Ses
         var status = RunStatus.Completed; string? error = null; string? finalText = null; string? runtimeSessionId = session.RuntimeSessionId;
         var text = new StringBuilder(); long inTok = 0, outTok = 0; var tools = 0;
         List<ActiveMount> mounts = []; var before = new Dictionary<string, Dictionary<string, (long, long)>>();
+        using var monitorCancellation = new CancellationTokenSource();
+        Task? monitor = null;
 
-        Emit(new JsonObject { ["type"] = "run_start", ["prompt"] = job.Prompt, ["user"] = job.Actor.Username });
+        Emit(new JsonObject { ["type"] = "run_start", ["prompt"] = job.Prompt, ["user"] = job.Actor.Username, ["projects"] = System.Text.Json.JsonSerializer.SerializeToNode(job.Projects, System.Text.Json.JsonSerializerOptions.Web) });
         try
         {
-            await runtime.EnsureStartedAsync(pool);
-            await runtime.MarkRunStartedAsync(pool.Id);
+            cts.Token.ThrowIfCancellationRequested();
+            var actor = await ExecutionAuthorization.RefreshAsync(db, job.Actor, cts.Token);
+            actor.RequireScope(Scopes.SessionExecute);
             var engine = sp.GetRequiredService<PermissionEngine>();
-            var wa = await engine.GetWorkspaceAccessAsync(job.Actor, ws);
-            var prep = await sp.GetRequiredService<RuntimeMaterializer>().PrepareAsync(job.Actor, ws, wa, run.Id, runtimeSessionId, job.Prompt, job.ModelKey, pool);
+            var (_, wa) = await engine.RequireWorkspaceAsync(actor, ws.Id, WorkspaceRole.Member);
+            if (session.Status != SessionStatus.Active) throw ApiException.Conflict("会话已归档");
+            await runtime.EnsureStartedAsync(pool);
+            cts.Token.ThrowIfCancellationRequested();
+            await runtime.MarkRunStartedAsync(pool.Id);
+            var prep = await sp.GetRequiredService<RuntimeMaterializer>().PrepareAsync(actor, ws, wa, run.Id, runtimeSessionId, ProjectReferences.Prompt(job.Prompt, job.Projects), job.ModelKey, pool);
             mounts = prep.Mounts;
+            cts.CancelAfter(prep.Request.Timeout);
+            monitor = WatchAuthorizationAsync(job, ws.Id, mounts, cts, monitorCancellation.Token);
             run.Model = prep.Model;
             foreach (var m in mounts) before[m.MountName] = await Task.Run(() => FileStore.Manifest(m.Directory));
 
             var provider = runtime.Provider(pool.RuntimeProvider);
-            var req = prep.Request;
+            var req = prep.Request with { ModelBudget = run.ReservedTokens };
             if (runtimeSessionId != null && !await provider.ResumeSessionAsync(new RuntimeSpec(pool.Id, req.DshHome), runtimeSessionId)) { runtimeSessionId = null; req = req with { RuntimeSessionId = null }; }
             if (runtimeSessionId == null) { runtimeSessionId = await provider.CreateSessionAsync(req); req = req with { RuntimeSessionId = runtimeSessionId }; }
 
@@ -117,9 +129,14 @@ public class RunCoordinator(IServiceScopeFactory scopes, RuntimeState state, Ses
         catch (ApiException ex) { status = RunStatus.Failed; error = ex.Message; Emit(new JsonObject { ["type"] = "error", ["message"] = ex.Message }); }
         catch (Exception ex)
         {
-            status = RunStatus.Failed; error = "平台内部错误：" + ex.Message;
+            status = RunStatus.Failed; error = "任务执行失败，请联系管理员查看运行日志";
             logger.LogError(ex, "运行 {RunId} 失败", run.Id);
             Emit(new JsonObject { ["type"] = "error", ["message"] = error });
+        }
+        finally
+        {
+            monitorCancellation.Cancel();
+            if (monitor != null) try { await monitor; } catch (OperationCanceledException) { }
         }
         if (status == RunStatus.Completed && cts.IsCancellationRequested) status = RunStatus.Cancelled;
 
@@ -135,16 +152,8 @@ public class RunCoordinator(IServiceScopeFactory scopes, RuntimeState state, Ses
                 if (added.Count + deleted.Count + modified.Count == 0) continue;
                 var sample = string.Join(", ", added.Concat(modified).Concat(deleted).Take(5));
                 var detail = $"Agent 运行期间共享空间「{m.SpaceName}」(shared/{m.MountName})：新增 {added.Count}、修改 {modified.Count}、删除 {deleted.Count}；示例：{sample}";
-                if (m.Permission == SharePermission.RO)
-                {
-                    Emit(new JsonObject { ["type"] = "alert", ["level"] = "error", ["message"] = $"检测到对只读共享空间「{m.SpaceName}」的修改（{added.Count + modified.Count + deleted.Count} 处），已记录审计" });
-                    await audit.LogAsync(job.Actor, "sharedspace.ro_violation", "SharedSpace", m.SharedSpaceId, pool.Id, ws.Id, detail, "denied");
-                }
-                else
-                {
-                    if (added.Count + modified.Count > 0) await audit.LogAsync(job.Actor, "sharedspace.write", "SharedSpace", m.SharedSpaceId, pool.Id, ws.Id, detail + "（来源：Agent）");
-                    if (deleted.Count > 0) await audit.LogAsync(job.Actor, "sharedspace.delete", "SharedSpace", m.SharedSpaceId, pool.Id, ws.Id, detail + "（来源：Agent）");
-                }
+                await audit.LogAsync(job.Actor, "sharedspace.observed-change", "SharedSpace", m.SharedSpaceId, pool.Id, ws.Id,
+                    detail + "（运行前后观察差异；可能来自其他有编辑权限的用户，不能据此确定操作者）", "observed");
             }
             catch (Exception ex) { logger.LogWarning(ex, "共享空间变更检测失败 {Mount}", m.MountName); }
         }
@@ -172,7 +181,52 @@ public class RunCoordinator(IServiceScopeFactory scopes, RuntimeState state, Ses
         catch (Exception ex)
         {
             logger.LogError(ex, "运行 {RunId} 收尾失败", run.Id);
-            Emit(new JsonObject { ["type"] = "run_end", ["status"] = "Failed", ["error"] = "收尾失败：" + ex.Message });
+            await RecoverAsync(run.Id);
+            Emit(new JsonObject { ["type"] = "run_end", ["status"] = "Failed", ["error"] = "运行结果保存失败，任务已结束；请联系管理员" });
+        }
+    }
+
+    private async Task WatchAuthorizationAsync(RunJob job, string workspaceId, List<ActiveMount> mounts, CancellationTokenSource runCancellation, CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            await Task.Delay(1000, ct);
+            try
+            {
+                await using var scope = scopes.CreateAsyncScope();
+                var sp = scope.ServiceProvider;
+                var db = sp.GetRequiredService<DshDbContext>();
+                var actor = await ExecutionAuthorization.RefreshAsync(db, job.Actor, ct);
+                actor.RequireScope(Scopes.SessionExecute);
+                var engine = sp.GetRequiredService<PermissionEngine>();
+                var (ws, access) = await engine.RequireWorkspaceAsync(actor, workspaceId, WorkspaceRole.Member);
+                foreach (var old in mounts)
+                {
+                    var space = await db.SharedSpaces.AsNoTracking().FirstOrDefaultAsync(s => s.Id == old.SharedSpaceId, ct);
+                    var mount = await db.WorkspaceSharedSpaceMounts.AsNoTracking().FirstOrDefaultAsync(m => m.WorkspaceId == ws.Id && m.SharedSpaceId == old.SharedSpaceId && m.MountName == old.MountName && m.Enabled, ct);
+                    if (space == null || mount == null) throw ApiException.Forbidden();
+                    var permission = (await engine.GetWorkspaceSpaceAccessAsync(actor, ws, access, space, mount)).Permission;
+                    if (permission == null || permission < old.Permission) throw ApiException.Forbidden();
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+            catch { runCancellation.Cancel(); return; }
+        }
+    }
+
+    private async Task RecoverAsync(string runId)
+    {
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            try
+            {
+                await using var scope = scopes.CreateAsyncScope();
+                var db = scope.ServiceProvider.GetRequiredService<DshDbContext>();
+                await db.AgentRuns.Where(r => r.Id == runId && r.Status == RunStatus.Running)
+                    .ExecuteUpdateAsync(update => update.SetProperty(r => r.Status, RunStatus.Failed).SetProperty(r => r.FinishedAt, DateTime.Now).SetProperty(r => r.ErrorMessage, "任务异常中断，请重新执行"));
+                return;
+            }
+            catch (Exception ex) { logger.LogWarning(ex, "运行 {RunId} 收尾重试 {Attempt}", runId, attempt); await Task.Delay(250); }
         }
     }
 }

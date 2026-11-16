@@ -50,6 +50,10 @@ public class DshDbContext(DbContextOptions<DshDbContext> options) : DbContext(op
     public DbSet<AuditLog> AuditLogs => Set<AuditLog>();
     /// <summary>Workspace 快照。</summary>
     public DbSet<WorkspaceSnapshot> WorkspaceSnapshots => Set<WorkspaceSnapshot>();
+    /// <summary>工作空间内的项目目录。</summary>
+    public DbSet<WorkspaceProject> WorkspaceProjects => Set<WorkspaceProject>();
+    /// <summary>工作空间里正在运行的隔离任务。</summary>
+    public DbSet<WorkspaceExecution> WorkspaceExecutions => Set<WorkspaceExecution>();
 
     /// <summary>枚举统一以字符串落库，便于直接查看数据。</summary>
     /// <param name="configurationBuilder">约定配置器。</param>
@@ -109,6 +113,7 @@ public class DshDbContext(DbContextOptions<DshDbContext> options) : DbContext(op
         {
             e.HasKey(x => x.Id);
             e.HasIndex(x => x.PoolId);
+            e.HasIndex(x => x.AssignedUserId).IsUnique().HasFilter("[AssignedUserId] IS NOT NULL");
             e.Property(x => x.Description).HasMaxLength(1000);
             e.Property(x => x.OverrideJson).HasColumnType("nvarchar(max)");
         });
@@ -156,13 +161,19 @@ public class DshDbContext(DbContextOptions<DshDbContext> options) : DbContext(op
             e.HasKey(x => x.Id);
             e.HasIndex(x => new { x.SessionId, x.Id });
             e.Property(x => x.Content).HasColumnType("nvarchar(max)");
+            e.Property(x => x.ProjectReferencesJson).HasColumnType("nvarchar(max)");
         });
 
         b.Entity<AgentRun>(e =>
         {
             e.HasKey(x => x.Id);
-            e.HasIndex(x => x.SessionId); e.HasIndex(x => new { x.PoolId, x.StartedAt });
+            e.HasIndex(x => x.SessionId);
+            e.HasIndex(x => new { x.PoolId, x.StartedAt });
+            e.HasIndex(x => new { x.UserId, x.RequestId }).IsUnique().HasFilter("[RequestId] IS NOT NULL");
+            e.HasIndex(x => x.SessionId, "UX_AgentRuns_ActiveSession").IsUnique().HasFilter("[Status] = N'Running'");
             e.Property(x => x.ErrorMessage).HasMaxLength(2000);
+            e.Property(x => x.RequestId).HasMaxLength(64);
+            e.Property(x => x.RequestHash).HasMaxLength(64);
         });
 
         b.Entity<RuntimeInstance>(e =>
@@ -184,6 +195,7 @@ public class DshDbContext(DbContextOptions<DshDbContext> options) : DbContext(op
             e.Property(x => x.ScopesJson).HasColumnType("nvarchar(max)");
             e.Property(x => x.AllowedPoolsJson).HasColumnType("nvarchar(max)");
             e.Property(x => x.AllowedWorkspacesJson).HasColumnType("nvarchar(max)");
+            e.Property(x => x.AllowedSharedSpacesJson).HasColumnType("nvarchar(max)");
         });
 
         b.Entity<ConfigItem>(e =>
@@ -224,6 +236,27 @@ public class DshDbContext(DbContextOptions<DshDbContext> options) : DbContext(op
             e.HasKey(x => x.Id);
             e.HasIndex(x => x.WorkspaceId);
             e.Property(x => x.FilePath).HasMaxLength(500);
+        });
+
+        b.Entity<WorkspaceProject>(e =>
+        {
+            e.ToTable("WorkspaceProject");
+            e.HasKey(x => x.Id);
+            e.HasIndex(x => new { x.WorkspaceId, x.Name }).IsUnique();
+            e.Property(x => x.Id).HasMaxLength(256);
+            e.Property(x => x.WorkspaceId).HasMaxLength(256);
+            e.Property(x => x.Description).HasMaxLength(1000);
+        });
+
+        b.Entity<WorkspaceExecution>(e =>
+        {
+            e.ToTable("WorkspaceExecution");
+            e.HasKey(x => x.Id);
+            e.HasIndex(x => new { x.WorkspaceId, x.Status });
+            e.Property(x => x.Id).HasMaxLength(256);
+            e.Property(x => x.WorkspaceId).HasMaxLength(256);
+            e.Property(x => x.UserId).HasMaxLength(256);
+            e.Property(x => x.TokenId).HasMaxLength(256);
         });
     }
 }

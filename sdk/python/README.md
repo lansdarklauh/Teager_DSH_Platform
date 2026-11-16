@@ -37,6 +37,19 @@ for event in session.stream("重构 files/ 下的脚本"):
         print("\n完成：", event["status"])
 ```
 
+## 在消息中引用项目
+
+先通过 `GET /api/v1/workspaces/{workspaceId}/projects` 查询当前工作空间的项目 ID，随后在消息中传入它们：
+
+```python
+result = session.send("检查项目结构并修复问题", project_ids=["prj_xxx"])
+for event in session.stream("为项目补充说明", project_ids=["prj_xxx"]):
+    if event["type"] == "text":
+        print(event["text"], end="", flush=True)
+```
+
+每条消息最多引用 8 个不同项目，项目必须属于该会话的工作空间且目录存在。引用需要 Token 的 `files:read` Scope；隔离任务执行还需要 `files:write`。项目名称、目录和描述作为独立元数据保留在消息历史中，Agent 按需读取项目文件；引用不会扩大权限。引用只随本次消息发送，后续消息需要再次传入 `project_ids`。
+
 ## 文件与共享空间
 
 ```python

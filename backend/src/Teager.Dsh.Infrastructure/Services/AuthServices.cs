@@ -104,7 +104,7 @@ public class AuthService(DshDbContext db, IOptions<DshOptions> opt, AuditService
 }
 
 /// <summary>用户管理服务（平台管理员）。</summary>
-public class UserService(DshDbContext db)
+public class UserService(DshDbContext db, PersonalWorkspaceService personal)
 {
     /// <summary>分页 / 关键字查询用户。</summary>
     /// <param name="q">关键字（登录名 / 显示名）。</param>
@@ -136,6 +136,9 @@ public class UserService(DshDbContext db)
     /// <returns>新用户。</returns>
     public async Task<User> CreateAsync(Actor actor, string username, string displayName, string? email, string? password, PlatformRole role, bool isService)
     {
+        actor.RequirePlatformAdmin();
+        if (!Enum.IsDefined(role)) throw ApiException.BadRequest("未知平台角色");
+        await using var transaction = await db.Database.BeginTransactionAsync();
         username = (username ?? "").Trim();
         if (!System.Text.RegularExpressions.Regex.IsMatch(username, "^[A-Za-z0-9._-]{2,40}$")) throw ApiException.BadRequest("登录名只能包含字母、数字、点、下划线、连字符，长度 2-40");
         if (await db.Users.AnyAsync(u => u.Username == username)) throw ApiException.Conflict("登录名已存在");
@@ -149,6 +152,8 @@ public class UserService(DshDbContext db)
         };
         db.Users.Add(u);
         await db.SaveChangesAsync();
+        await personal.EnsureAsync(u.Id);
+        await transaction.CommitAsync();
         return u;
     }
 
@@ -162,6 +167,8 @@ public class UserService(DshDbContext db)
     /// <returns>更新后的用户。</returns>
     public async Task<User> UpdateAsync(Actor actor, string id, string? displayName, string? email, PlatformRole? role, UserStatus? status)
     {
+        actor.RequirePlatformAdmin();
+        if (role != null && !Enum.IsDefined(role.Value) || status != null && !Enum.IsDefined(status.Value)) throw ApiException.BadRequest("未知角色或状态");
         var u = await db.Users.FirstOrDefaultAsync(x => x.Id == id) ?? throw ApiException.NotFound("用户不存在");
         var losesAdmin = u.Role == PlatformRole.Admin && u.Status == UserStatus.Active && ((role != null && role != PlatformRole.Admin) || (status != null && status != UserStatus.Active));
         if (losesAdmin && await db.Users.CountAsync(x => x.Role == PlatformRole.Admin && x.Status == UserStatus.Active) <= 1) throw ApiException.BadRequest("不能移除或禁用最后一个可用的平台管理员");
@@ -184,6 +191,7 @@ public class UserService(DshDbContext db)
     /// <param name="newPassword">新密码。</param>
     public async Task ResetPasswordAsync(Actor actor, string id, string newPassword)
     {
+        actor.RequirePlatformAdmin();
         var u = await db.Users.FirstOrDefaultAsync(x => x.Id == id) ?? throw ApiException.NotFound("用户不存在");
         if (u.IsServiceAccount) throw ApiException.BadRequest("服务账号没有密码");
         AuthService.ValidatePassword(newPassword);
@@ -210,7 +218,8 @@ public class TokenService(DshDbContext db, PermissionEngine engine)
     /// <param name="expiresInHours">有效小时数（仅临时 Token）。</param>
     /// <param name="serviceAccountId">服务 Token 归属的服务账号（仅平台管理员）。</param>
     /// <returns>Token 记录与明文。</returns>
-    public async Task<(ApiToken Token, string Plain)> CreateAsync(Actor actor, string name, TokenType type, string[] scopes, string[] allowedPools, string[] allowedWorkspaces, int? expiresInDays, int? expiresInHours, string? serviceAccountId)
+    /// <param name="allowedSharedSpaces">Explicit shared-space whitelist.</param>
+    public async Task<(ApiToken Token, string Plain)> CreateAsync(Actor actor, string name, TokenType type, string[] scopes, string[] allowedPools, string[] allowedWorkspaces, int? expiresInDays, int? expiresInHours, string? serviceAccountId, string[]? allowedSharedSpaces = null)
     {
         if (actor.Via != "web") throw ApiException.Forbidden("Token 只能通过 Web 登录态创建");
         name = (name ?? "").Trim();
@@ -219,12 +228,35 @@ public class TokenService(DshDbContext db, PermissionEngine engine)
         var bad = scopes.Except(Scopes.All).ToList();
         if (bad.Count > 0) throw ApiException.BadRequest("未知 Scope：" + string.Join(", ", bad));
 
+        if (!Enum.IsDefined(type)) throw ApiException.BadRequest("未知 Token 类型");
+        allowedSharedSpaces ??= [];
+        if (!actor.IsPlatformAdmin)
+        {
+            var forbidden = new[] { Scopes.PoolManage, Scopes.WorkspaceWrite, Scopes.WorkspaceManage, Scopes.ShareManage, Scopes.RuntimeManage, Scopes.RuntimeRead };
+            if (scopes.Intersect(forbidden).Any()) throw ApiException.Forbidden("普通用户不可创建管理 Scope 的 Token");
+            if (allowedPools.Length > 0) throw ApiException.Forbidden("普通用户 Token 不可绑定整个 Pool");
+            var personal = await db.Workspaces.Where(w => w.AssignedUserId == actor.UserId && w.Status == WorkspaceStatus.Active).Select(w => w.Id).ToArrayAsync();
+            if (personal.Length == 0) throw ApiException.Conflict("尚未分配个人工作空间");
+            if (allowedWorkspaces.Length == 0) allowedWorkspaces = personal;
+            if (allowedWorkspaces.Except(personal).Any()) throw ApiException.Forbidden("Token 只能绑定自己的工作空间");
+        }
+        if ((scopes.Contains(Scopes.WorkspaceExecute) || scopes.Contains(Scopes.SessionExecute)) &&
+            (!scopes.Contains(Scopes.FilesRead) || !scopes.Contains(Scopes.FilesWrite)))
+            throw ApiException.BadRequest("执行类 Token 必须同时包含 files:read 和 files:write");
+        foreach (var id in allowedSharedSpaces)
+        {
+            var space = await db.SharedSpaces.FirstOrDefaultAsync(s => s.Id == id) ?? throw ApiException.NotFound();
+            var access = await engine.GetUserSpaceAccessAsync(actor, space);
+            if (access.Permission == null) throw ApiException.NotFound();
+            if (scopes.Contains(Scopes.ShareWrite) && access.Permission < SharePermission.RW) throw ApiException.Forbidden("共享资源仅允许只读");
+        }
         var owner = actor.UserId;
         if (type == TokenType.Service)
         {
             if (!actor.IsPlatformAdmin) throw ApiException.Forbidden("只有平台管理员可以创建服务 Token");
             var svc = await db.Users.FirstOrDefaultAsync(u => u.Id == serviceAccountId && u.IsServiceAccount && u.Status == UserStatus.Active) ?? throw ApiException.BadRequest("请选择有效的服务账号");
             owner = svc.Id;
+            if (allowedWorkspaces.Length == 0 && allowedSharedSpaces.Length == 0) throw ApiException.BadRequest("服务 Token 必须绑定明确的工作空间或共享空间");
         }
         // 白名单里的 Pool / Workspace 创建者必须自己可见，避免通过 Token 探测不可见资源
         foreach (var p in allowedPools) await engine.RequirePoolViewAsync(actor, p);
@@ -241,7 +273,7 @@ public class TokenService(DshDbContext db, PermissionEngine engine)
         {
             Id = IdGen.New("tok"), OwnerUserId = owner, Name = name, Type = type, TokenHash = AuthService.Hash(plain), TokenPrefix = plain[..12],
             ScopesJson = JsonSerializer.Serialize(scopes.Distinct()), AllowedPoolsJson = JsonSerializer.Serialize(allowedPools.Distinct()),
-            AllowedWorkspacesJson = JsonSerializer.Serialize(allowedWorkspaces.Distinct()), ExpiresAt = exp, CreatedBy = actor.UserId
+            AllowedWorkspacesJson = JsonSerializer.Serialize(allowedWorkspaces.Distinct()), AllowedSharedSpacesJson = JsonSerializer.Serialize(allowedSharedSpaces.Distinct()), ExpiresAt = exp, CreatedBy = actor.UserId
         };
         db.ApiTokens.Add(t);
         await db.SaveChangesAsync();
@@ -253,6 +285,7 @@ public class TokenService(DshDbContext db, PermissionEngine engine)
     /// <param name="all">是否查看全部（仅管理员）。</param>
     public async Task<List<object>> ListAsync(Actor actor, bool all)
     {
+        if (actor.Via != "web") throw ApiException.Forbidden("Token 管理仅支持 Web 登录态");
         var q = db.ApiTokens.AsNoTracking().AsQueryable();
         if (!(all && actor.IsPlatformAdmin)) q = q.Where(t => t.OwnerUserId == actor.UserId || t.CreatedBy == actor.UserId);
         var rows = await q.OrderByDescending(t => t.CreatedAt).Take(500).ToListAsync();
@@ -260,7 +293,7 @@ public class TokenService(DshDbContext db, PermissionEngine engine)
         return rows.Select(t => (object)new
         {
             t.Id, t.Name, Type = t.Type.ToString(), t.TokenPrefix, Owner = users.GetValueOrDefault(t.OwnerUserId), t.OwnerUserId,
-            Scopes = JsonSerializer.Deserialize<string[]>(t.ScopesJson), AllowedPools = JsonSerializer.Deserialize<string[]>(t.AllowedPoolsJson), AllowedWorkspaces = JsonSerializer.Deserialize<string[]>(t.AllowedWorkspacesJson),
+            Scopes = JsonSerializer.Deserialize<string[]>(t.ScopesJson), AllowedPools = JsonSerializer.Deserialize<string[]>(t.AllowedPoolsJson), AllowedWorkspaces = JsonSerializer.Deserialize<string[]>(t.AllowedWorkspacesJson), AllowedSharedSpaces = JsonSerializer.Deserialize<string[]>(t.AllowedSharedSpacesJson),
             t.ExpiresAt, t.RevokedAt, t.LastUsedAt, t.LastUsedIp, t.CreatedAt,
             Status = t.RevokedAt != null ? "已吊销" : t.ExpiresAt != null && t.ExpiresAt < DateTime.Now ? "已过期" : "有效"
         }).ToList();
@@ -271,6 +304,7 @@ public class TokenService(DshDbContext db, PermissionEngine engine)
     /// <param name="id">Token ID。</param>
     public async Task<ApiToken> RevokeAsync(Actor actor, string id)
     {
+        if (actor.Via != "web") throw ApiException.Forbidden("Token 管理仅支持 Web 登录态");
         var t = await db.ApiTokens.FirstOrDefaultAsync(x => x.Id == id) ?? throw ApiException.NotFound("Token 不存在");
         if (t.OwnerUserId != actor.UserId && t.CreatedBy != actor.UserId && !actor.IsPlatformAdmin) throw ApiException.NotFound("Token 不存在");
         t.RevokedAt ??= DateTime.Now;
@@ -292,9 +326,10 @@ public class TokenService(DshDbContext db, PermissionEngine engine)
         if (t.LastUsedAt == null || DateTime.Now - t.LastUsedAt > TimeSpan.FromMinutes(1)) { t.LastUsedAt = DateTime.Now; t.LastUsedIp = ip; await db.SaveChangesAsync(); }
         return new Actor
         {
-            UserId = user.Id, Username = user.Username, IsPlatformAdmin = user.Role == PlatformRole.Admin && !user.IsServiceAccount, Via = "token", TokenId = t.Id, Ip = ip,
+            UserId = user.Id, Username = user.Username, IsPlatformAdmin = user.Role == PlatformRole.Admin && !user.IsServiceAccount, IsServiceAccount = user.IsServiceAccount, Via = "token", TokenId = t.Id, Ip = ip,
             Scopes = JsonSerializer.Deserialize<string[]>(t.ScopesJson)!.ToHashSet(),
             AllowedPools = JsonSerializer.Deserialize<string[]>(t.AllowedPoolsJson)!.ToHashSet(),
+            AllowedSharedSpaces = JsonSerializer.Deserialize<string[]>(t.AllowedSharedSpacesJson)!.ToHashSet(),
             AllowedWorkspaces = JsonSerializer.Deserialize<string[]>(t.AllowedWorkspacesJson)!.ToHashSet()
         };
     }

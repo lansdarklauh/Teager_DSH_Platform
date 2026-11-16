@@ -54,7 +54,8 @@ public class SharedSpacesController(ActorAccessor accessor, SharedSpaceService s
     {
         var (s, a) = await spaces.RequireAsync(Me, id, SharePermission.RO);
         var graph = await engine.GetGraphAsync();
-        var mounts = await db.WorkspaceSharedSpaceMounts.AsNoTracking().Where(m => m.SharedSpaceId == id).CountAsync();
+        var visibleWorkspaces = await new WorkspaceListHelper(db, engine).AccessibleWorkspaceIdsAsync(Me);
+        var mounts = await db.WorkspaceSharedSpaceMounts.AsNoTracking().Where(m => m.SharedSpaceId == id && visibleWorkspaces.Contains(m.WorkspaceId)).CountAsync();
         return new
         {
             s.Id, s.Name, s.Description, s.MountName, s.OwnerPoolId, OwnerPoolName = s.OwnerPoolId == null ? "组织级" : graph.NameOf(s.OwnerPoolId), s.QuotaMb, s.StorageBytes, Status = s.Status.ToString(), s.CreatedAt,
@@ -83,11 +84,19 @@ public class SharedSpacesController(ActorAccessor accessor, SharedSpaceService s
 
     // ─────────── 授权 ───────────
 
+    [HttpPost("shared-spaces/{id}/restore"), Scope(Scopes.ShareManage)]
+    public async Task<IActionResult> Restore(string id)
+    {
+        await spaces.RestoreAsync(Me, id);
+        await audit.LogAsync(Me, "sharedspace.restore", "SharedSpace", id);
+        return NoContent();
+    }
+
     /// <summary>授权列表。</summary>
     [HttpGet("shared-spaces/{id}/grants"), Scope(Scopes.ShareRead)]
     public async Task<object> Grants(string id)
     {
-        await spaces.RequireAsync(Me, id, SharePermission.RO);
+        await spaces.RequireAsync(Me, id, SharePermission.MANAGE);
         return await spaces.ListGrantsAsync(id);
     }
 
@@ -127,8 +136,7 @@ public class SharedSpacesController(ActorAccessor accessor, SharedSpaceService s
     [HttpGet("shared-spaces/{id}/permissions/explain"), Scope(Scopes.ShareRead)]
     public async Task<object> Explain(string id)
     {
-        var s = await db.SharedSpaces.AsNoTracking().FirstOrDefaultAsync(x => x.Id == id) ?? throw ApiException.NotFound("共享空间不存在或无权访问");
-        var a = await engine.GetUserSpaceAccessAsync(Me, s);
+        var (s, a) = await spaces.RequireAsync(Me, id, SharePermission.RO);
         var graph = await engine.GetGraphAsync();
         return new { s.Id, s.Name, Permission = a.Permission?.ToString(), a.Source, ViaPool = a.ViaPoolId == null ? null : graph.NameOf(a.ViaPoolId), a.Path, a.Notes };
     }
@@ -159,7 +167,7 @@ public class SharedSpacesController(ActorAccessor accessor, SharedSpaceService s
     {
         var a = await files.ResolveSharedAreaAsync(Me, id, true);
         var bytes = Encoding.UTF8.GetBytes(req.Content ?? "");
-        await files.EnsureQuotaAsync(a, bytes.Length);
+        await files.EnsureQuotaAsync(a, bytes.Length, req.Path);
         files.VersionBefore(a, req.Path);
         await FileStore.WriteAsync(a.Root, req.Path, new MemoryStream(bytes), (long)opt.Value.Platform.MaxUploadMb * 1024 * 1024);
         await files.RecordAsync(Me, a, "write", req.Path);
@@ -177,7 +185,7 @@ public class SharedSpacesController(ActorAccessor accessor, SharedSpaceService s
             var name = Path.GetFileName(f.FileName);
             if (string.IsNullOrEmpty(name)) continue;
             var rel = FileStore.Normalize(path); rel = rel.Length == 0 ? name : rel + "/" + name;
-            await files.EnsureQuotaAsync(a, f.Length);
+            await files.EnsureQuotaAsync(a, f.Length, rel);
             files.VersionBefore(a, rel);
             await using var s = f.OpenReadStream();
             await FileStore.WriteAsync(a.Root, rel, s, (long)opt.Value.Platform.MaxUploadMb * 1024 * 1024);
@@ -192,6 +200,7 @@ public class SharedSpacesController(ActorAccessor accessor, SharedSpaceService s
     public async Task<IActionResult> Mkdir(string id, PathRequest req)
     {
         var a = await files.ResolveSharedAreaAsync(Me, id, true);
+        await files.EnsureQuotaAsync(a, 0, req.Path);
         FileStore.Mkdir(a.Root, req.Path);
         await files.RecordAsync(Me, a, "mkdir", req.Path);
         return NoContent();

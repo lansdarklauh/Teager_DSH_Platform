@@ -3,7 +3,10 @@ import { onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { FolderOpenOutlined, PlusOutlined } from '@ant-design/icons-vue'
 import { spaceApi } from '@/api'
+import { http } from '@/api/http'
 import { fmtBytes } from '@/utils/format'
+import { useAuthStore } from '@/stores/auth'
+const auth = useAuthStore()
 import PageHeader from '@/components/PageHeader.vue'
 import Tags from '@/components/Tags.vue'
 import CreateSpaceModal from '@/components/CreateSpaceModal.vue'
@@ -14,6 +17,7 @@ const loading = ref(true)
 const archived = ref(false)
 const keyword = ref('')
 const show = ref(false)
+async function restore(id: string) { await http.post(`/shared-spaces/${id}/restore`); await load() }
 async function load() { loading.value = true; try { list.value = ((await spaceApi.list({ includeArchived: archived.value ? true : undefined })) as any[]) } finally { loading.value = false } }
 onMounted(load)
 watch(archived, load)
@@ -24,14 +28,15 @@ const filtered = () => list.value.filter((s) => !keyword.value || (s.name + (s.d
   <div class="page" data-mod="space">
     <PageHeader title="共享空间" sub="独立的一级资源：授权给 Pool / 用户（RO / RW / MANAGE），可向子 Pool 继承，并由 Workspace 按需挂载">
       <template #icon><FolderOpenOutlined /></template>
-      <template #actions><a-button type="primary" @click="show = true"><PlusOutlined /> 新建共享空间</a-button></template>
+      <template #actions><a-button v-if="auth.isAdmin" type="primary" @click="show = true"><PlusOutlined /> 新建共享空间</a-button></template>
     </PageHeader>
     <div class="card" style="margin-bottom: 24px"><div class="row-wrap"><a-input-search v-model:value="keyword" placeholder="搜索名称 / 描述 / 所属" style="width: 300px" allow-clear /><a-checkbox v-model:checked="archived">显示已归档</a-checkbox></div></div>
     <a-spin :spinning="loading">
       <div v-if="filtered().length" class="grid grid-auto">
-        <div v-for="s in filtered()" :key="s.id" class="card hover sp" @click="router.push(`/shared-spaces/${s.id}`)">
+        <div v-for="s in filtered()" :key="s.id" class="card hover sp" @click="s.status !== 'Archived' && router.push(`/shared-spaces/${s.id}`)">
           <div class="row"><span class="chip solid"><FolderOpenOutlined /></span><div style="min-width: 0"><b class="ellipsis" style="font-size: 15px">{{ s.name }}</b><div class="muted small ellipsis">所属：{{ s.ownerPoolName }}</div></div><span class="spacer" /><span v-if="s.status === 'Archived'" class="tag warn">已归档</span></div>
           <div class="muted small desc">{{ s.description || '暂无描述' }}</div>
+          <a-button v-if="auth.isAdmin && s.status === 'Archived'" @click.stop="restore(s.id)">恢复共享空间</a-button>
           <div class="row-wrap" style="gap: 8px"><Tags kind="role" :value="s.permission" /><Tags kind="source" :value="s.source" :path="s.path" /></div>
           <div class="row"><span class="mono muted small">shared/{{ s.mountName }}</span><span class="spacer" /><span class="muted small">{{ fmtBytes(s.storageBytes) }}{{ s.quotaMb ? ` / ${s.quotaMb} MB` : '' }}</span></div>
         </div>

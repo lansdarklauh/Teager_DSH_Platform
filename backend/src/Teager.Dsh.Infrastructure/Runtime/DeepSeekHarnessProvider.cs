@@ -14,7 +14,7 @@ namespace Teager.Dsh.Infrastructure.Runtime;
 /// DeepSeek Harness Provider：每次消息启动一个 <c>dsh headless --json</c> 子进程，
 /// 通过 <c>--session-id</c> 续接同一 Runtime 会话；每个 Pool 使用独立的 DSH_HOME，实现会话 / 凭据 / 插件隔离。
 /// </summary>
-public class DeepSeekHarnessProvider(IOptions<DshOptions> opt, ILogger<DeepSeekHarnessProvider> logger) : IRuntimeProvider
+public class DeepSeekHarnessProvider(IOptions<DshOptions> opt, ILogger<DeepSeekHarnessProvider> logger, DockerSandbox sandbox) : IRuntimeProvider
 {
     /// <summary>运行中的子进程：runId → (poolId, 进程)，用于停止 Runtime 时批量终止。</summary>
     private readonly ConcurrentDictionary<string, (string PoolId, Process Proc)> _active = new();
@@ -26,7 +26,7 @@ public class DeepSeekHarnessProvider(IOptions<DshOptions> opt, ILogger<DeepSeekH
     public async Task<RuntimeHealth> StartRuntimeAsync(RuntimeSpec spec, CancellationToken ct)
     {
         Directory.CreateDirectory(spec.DshHome);
-        SeedHome(spec.DshHome);
+        if (!opt.Value.Sandbox.Enabled) SeedHome(spec.DshHome);
         return await HealthCheckAsync(spec, ct);
     }
 
@@ -50,6 +50,12 @@ public class DeepSeekHarnessProvider(IOptions<DshOptions> opt, ILogger<DeepSeekH
         var active = _active.Count(k => k.Value.PoolId == spec.PoolId);
         try
         {
+            if (opt.Value.Sandbox.Enabled)
+            {
+                sandbox.RequireEnabled();
+                await sandbox.CliAsync(["image", "inspect", opt.Value.Sandbox.Image], ct);
+                return new RuntimeHealth(true, "isolated", "隔离 Agent 镜像已就绪", active);
+            }
             var env = ProcessUtil.BuildEnv(opt.Value.Runtime.EnvPassthrough, new Dictionary<string, string> { ["DSH_HOME"] = spec.DshHome, ["NODE_NO_WARNINGS"] = "1" });
             using var p = Process.Start(ProcessUtil.CreateStartInfo(opt.Value.Runtime.DshExecutable, ["--version"], spec.DshHome, env)) ?? throw new InvalidOperationException("无法启动 dsh");
             p.StandardInput.Close();
@@ -74,6 +80,11 @@ public class DeepSeekHarnessProvider(IOptions<DshOptions> opt, ILogger<DeepSeekH
     /// <inheritdoc />
     public async IAsyncEnumerable<JsonObject> SendMessageAsync(RunRequest req, [EnumeratorCancellation] CancellationToken ct)
     {
+        if (req.ExecutionActor != null && (!req.ExecutionActor.IsPlatformAdmin || opt.Value.Sandbox.Enabled))
+        {
+            await foreach (var item in sandbox.SendAgentAsync(req, ct)) yield return item;
+            yield break;
+        }
         var args = new List<string> { "headless" };
         if (!string.IsNullOrEmpty(req.PatchFile) && File.Exists(req.PatchFile)) { args.Add("--patch"); args.Add(req.PatchFile); }
         args.Add("--json");

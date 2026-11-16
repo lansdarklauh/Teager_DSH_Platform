@@ -20,6 +20,8 @@ public class DshOptions
     public RateLimitOptions RateLimit { get; set; } = new();
     /// <summary>平台默认策略（Pool 策略只能在其基础上收紧）。</summary>
     public PlatformPolicyOptions Policy { get; set; } = new();
+    /// <summary>隔离沙箱配置。未启用时 Agent 仍在 API 进程内运行。</summary>
+    public SandboxOptions Sandbox { get; set; } = new();
 }
 
 /// <summary>目录配置。三类目录建议挂载到不同的宿主机路径，避免撑满 Docker 数据盘。</summary>
@@ -58,6 +60,8 @@ public class PlatformOptions
     public int FileVersionsKeep { get; set; } = 10;
     /// <summary>是否自动执行数据库迁移。</summary>
     public bool AutoMigrate { get; set; } = true;
+    /// <summary>额外信任的反向代理地址。为空时只信任本机回环代理。</summary>
+    public string[] TrustedProxies { get; set; } = [];
 }
 
 /// <summary>Runtime 配置。</summary>
@@ -65,6 +69,8 @@ public class RuntimeOptions
 {
     /// <summary>新建 Pool 的默认 Provider：DeepSeekHarness / Mock。</summary>
     public string DefaultProvider { get; set; } = "DeepSeekHarness";
+    /// <summary>启动时将系统个人 Pool 同步到默认引擎；不修改管理员创建的其他 Pool。</summary>
+    public bool SynchronizePersonalPoolProvider { get; set; } = true;
     /// <summary>dsh 可执行文件（名称或绝对路径），Windows 可指向 dsh.cmd。</summary>
     public string DshExecutable { get; set; } = "dsh";
     /// <summary>首次创建 Pool 的 DSH_HOME 时，从该目录复制 .credentials.yaml / settings.yaml 作为基础配置（可空）。</summary>
@@ -78,7 +84,7 @@ public class RuntimeOptions
     /// <summary>单次运行的最长分钟数。</summary>
     public int RunTimeoutMinutes { get; set; } = 30;
     /// <summary>是否启用 Workspace 终端（WebSocket）。终端等同于容器内 shell，请谨慎开启。</summary>
-    public bool TerminalEnabled { get; set; } = false;
+    public bool TerminalEnabled { get; set; } = true;
     /// <summary>平台级默认环境变量（优先级最低，被组织 / Pool / Workspace 密钥覆盖），如 DEEPSEEK_API_KEY。仅注入 Runtime，不对前端暴露。</summary>
     public Dictionary<string, string> ExtraEnv { get; set; } = new();
     /// <summary>允许透传给 Runtime 子进程的宿主环境变量名（其余环境变量一律不传，防止泄露平台密钥）。</summary>

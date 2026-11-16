@@ -20,6 +20,8 @@ public class UsageService(DshDbContext db, PermissionEngine engine, PolicyServic
         days = Math.Clamp(days, 1, 365);
         var since = DateTime.Today.AddDays(-(days - 1));
         var q = db.UsageLogs.AsNoTracking().Where(u => u.Time >= since);
+        var visibleWorkspaces = await new WorkspaceListHelper(db, engine).AccessibleWorkspaceIdsAsync(actor);
+        q = q.Where(u => visibleWorkspaces.Contains(u.WorkspaceId));
         var canBreakdownUsers = actor.IsPlatformAdmin; string scopeName = "平台"; object? quota = null;
 
         if (workspaceId != null)
@@ -40,9 +42,9 @@ public class UsageService(DshDbContext db, PermissionEngine engine, PolicyServic
             if (!access.CanManage) q = q.Where(u => u.UserId == actor.UserId);
             canBreakdownUsers = access.CanManage; scopeName = "Pool：" + graph.NameOf(poolId) + "（含子 Pool）";
             var eff = await policy.GetEffectiveAsync(poolId);
-            var wsStorage = await db.Workspaces.AsNoTracking().Where(w => ids.Contains(w.PoolId) && w.Status == WorkspaceStatus.Active).SumAsync(w => (long?)w.StorageBytes) ?? 0;
-            var todayRuns = await db.AgentRuns.CountAsync(r => r.PoolId == poolId && r.StartedAt >= DateTime.Today);
-            var todayTokens = await db.UsageLogs.Where(u => u.PoolId == poolId && u.Time >= DateTime.Today).SumAsync(u => (long?)(u.InputTokens + u.OutputTokens)) ?? 0;
+            var wsStorage = await db.Workspaces.AsNoTracking().Where(w => ids.Contains(w.PoolId) && visibleWorkspaces.Contains(w.Id) && w.Status == WorkspaceStatus.Active).SumAsync(w => (long?)w.StorageBytes) ?? 0;
+            var todayRuns = await db.AgentRuns.CountAsync(r => ids.Contains(r.PoolId) && visibleWorkspaces.Contains(r.WorkspaceId) && (access.CanManage || r.UserId == actor.UserId) && r.StartedAt >= DateTime.Today);
+            var todayTokens = await db.UsageLogs.Where(u => ids.Contains(u.PoolId) && visibleWorkspaces.Contains(u.WorkspaceId) && (access.CanManage || u.UserId == actor.UserId) && u.Time >= DateTime.Today).SumAsync(u => (long?)(u.InputTokens + u.OutputTokens)) ?? 0;
             quota = new { WorkspaceStorageBytes = wsStorage, MaxMessagesPerDay = eff.MaxMessagesPerDay, TodayMessages = todayRuns, MaxTokensPerDay = eff.MaxTokensPerDay, TodayTokens = todayTokens };
         }
         else if (!actor.IsPlatformAdmin) { q = q.Where(u => u.UserId == actor.UserId); scopeName = "我的用量"; }

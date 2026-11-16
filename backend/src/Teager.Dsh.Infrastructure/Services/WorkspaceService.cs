@@ -31,6 +31,9 @@ public partial class WorkspaceService(DshDbContext db, PermissionEngine engine, 
     /// <returns>新 Workspace。</returns>
     public async Task<Workspace> CreateAsync(Actor actor, string poolId, string name, string? description, bool inheritPoolMembers = true)
     {
+        actor.RequirePlatformAdmin();
+        await using var transaction = await db.Database.BeginTransactionAsync();
+        await DatabaseAdmission.LockAsync(db);
         var access = await engine.RequirePoolViewAsync(actor, poolId);
         if (!(access.CanManage || access.DirectRole >= PoolRole.Member)) throw ApiException.Forbidden("需要该 Pool 的成员（Member 及以上）权限才能创建 Workspace");
         var pool = await db.Pools.FirstOrDefaultAsync(p => p.Id == poolId && p.Status == PoolStatus.Active) ?? throw ApiException.NotFound("Pool 不存在");
@@ -54,6 +57,7 @@ public partial class WorkspaceService(DshDbContext db, PermissionEngine engine, 
         await db.SaveChangesAsync();
         Directory.CreateDirectory(paths.WorkspaceFiles(ws.Id));
         Directory.CreateDirectory(paths.WorkspaceShared(ws.Id));
+        await transaction.CommitAsync();
         pc.Invalidate();
         return ws;
     }
@@ -277,8 +281,10 @@ public partial class WorkspaceService(DshDbContext db, PermissionEngine engine, 
     /// <param name="mode">删除模式。</param>
     public async Task DeleteAsync(Actor actor, string id, string mode)
     {
+        actor.RequirePlatformAdmin();
         var (ws, _) = await engine.RequireWorkspaceAsync(actor, id, null, manage: true);
         if (await db.AgentRuns.AnyAsync(r => r.WorkspaceId == id && r.Status == RunStatus.Running)) throw ApiException.Conflict("该 Workspace 仍有运行中的任务，请先取消");
+        if (await db.Set<WorkspaceExecution>().AnyAsync(e => e.WorkspaceId == id && e.Status == "Running")) throw ApiException.Conflict("请先停止该工作空间的终端和应用");
         switch (mode)
         {
             case "runtime_context": await ClearRuntimeContextAsync(ws); break;
@@ -429,14 +435,37 @@ public partial class WorkspaceService(DshDbContext db, PermissionEngine engine, 
     /// <param name="snapshotId">快照 ID。</param>
     public async Task RestoreSnapshotAsync(Actor actor, string workspaceId, string snapshotId)
     {
-        var (ws, _) = await engine.RequireWorkspaceAsync(actor, workspaceId, WorkspaceRole.Admin);
+        await using var transaction = await db.Database.BeginTransactionAsync();
+        await DatabaseAdmission.LockAsync(db);
+        var (ws, _) = await engine.RequireWorkspaceAsync(actor, workspaceId, WorkspaceRole.Member);
         var snap = await db.WorkspaceSnapshots.FirstOrDefaultAsync(s => s.Id == snapshotId && s.WorkspaceId == ws.Id) ?? throw ApiException.NotFound("快照不存在");
         if (await db.AgentRuns.AnyAsync(r => r.WorkspaceId == ws.Id && r.Status == RunStatus.Running)) throw ApiException.Conflict("有运行中的任务，无法恢复快照");
+        if (await db.Set<WorkspaceExecution>().AnyAsync(e => e.WorkspaceId == ws.Id && e.Status == "Running")) throw ApiException.Conflict("请先停止该工作空间的终端和应用");
         var file = paths.SnapshotFile(snap.Id);
         if (!File.Exists(file)) throw ApiException.NotFound("快照文件已丢失");
         var files = paths.WorkspaceFiles(ws.Id);
-        await Task.Run(() => { if (Directory.Exists(files)) Directory.Delete(files, true); FileStore.ExtractZip(file, files); });
-        await RefreshStorageAsync(ws);
+        var prepared = Path.Combine(paths.WorkspaceRoot(ws.Id), ".restore-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            await Task.Run(() => FileStore.ExtractZip(file, prepared));
+            var size = FileStore.DirSize(prepared);
+            var limit = (await policy.GetEffectiveAsync(ws.PoolId)).MaxStorageMbPerWorkspace;
+            if (limit > 0 && size > (long)limit * 1024 * 1024) throw ApiException.Quota("快照超过个人文件配额");
+            if (opt.Value.Sandbox.Enabled && size + FileStore.DirSize(Path.Combine(paths.WorkspaceRoot(ws.Id), "home")) + StorageQuota.OrphanBytes(paths, ws.Id)
+                > (long)opt.Value.Sandbox.MaxStorageMb * 1024 * 1024) throw ApiException.Quota("快照超过个人隔离环境的存储配额");
+            using var trash = new FileTrash(paths, "workspace", ws.Id);
+            trash.Stage(files);
+            Directory.Move(prepared, files);
+            try
+            {
+                ws.StorageBytes = size;
+                await db.SaveChangesAsync();
+                await transaction.CommitAsync();
+            }
+            catch { Directory.Move(files, prepared); throw; }
+            trash.Commit();
+        }
+        finally { if (Directory.Exists(prepared)) Directory.Delete(prepared, true); }
     }
 
     /// <summary>删除快照。</summary>
@@ -445,7 +474,7 @@ public partial class WorkspaceService(DshDbContext db, PermissionEngine engine, 
     /// <param name="snapshotId">快照 ID。</param>
     public async Task DeleteSnapshotAsync(Actor actor, string workspaceId, string snapshotId)
     {
-        var (ws, _) = await engine.RequireWorkspaceAsync(actor, workspaceId, WorkspaceRole.Admin);
+        var (ws, _) = await engine.RequireWorkspaceAsync(actor, workspaceId, WorkspaceRole.Member);
         var snap = await db.WorkspaceSnapshots.FirstOrDefaultAsync(s => s.Id == snapshotId && s.WorkspaceId == ws.Id) ?? throw ApiException.NotFound("快照不存在");
         var f = paths.SnapshotFile(snap.Id); if (File.Exists(f)) File.Delete(f);
         db.WorkspaceSnapshots.Remove(snap);

@@ -31,6 +31,7 @@ public record UpdateUserRequest(string? DisplayName, string? Email, PlatformRole
 /// <summary>重置密码请求。</summary>
 /// <param name="NewPassword">新密码。</param>
 public record ResetPasswordRequest(string NewPassword);
+public record AssignWorkspaceRequest(string WorkspaceId);
 /// <summary>运行节点请求。</summary>
 /// <param name="Name">名称。</param>
 /// <param name="Host">主机描述。</param>
@@ -39,11 +40,11 @@ public record ResetPasswordRequest(string NewPassword);
 public record NodeRequest(string? Name, string? Host, string? Status, int? MaxRuntimes);
 
 /// <summary>用户管理（平台管理员），以及成员选择器用的轻量检索。</summary>
-public class UsersController(ActorAccessor accessor, UserService users, AuditService audit) : ApiBase(accessor)
+public class UsersController(ActorAccessor accessor, UserService users, AuditService audit, PersonalWorkspaceService personal) : ApiBase(accessor)
 {
     /// <summary>用户视图。</summary>
     /// <param name="u">用户。</param>
-    private static object View(User u) => new { u.Id, u.Username, u.DisplayName, u.Email, Role = u.Role.ToString(), Status = u.Status.ToString(), u.IsServiceAccount, u.LastLoginAt, u.CreatedAt };
+    private static object View(User u) => new { u.Id, u.Username, u.DisplayName, u.Email, Role = u.Role.ToString(), Status = u.Status.ToString(), u.IsServiceAccount, u.DefaultWorkspaceId, u.LastLoginAt, u.CreatedAt };
 
     /// <summary>用户列表（仅管理员）。</summary>
     [HttpGet("users")]
@@ -55,7 +56,7 @@ public class UsersController(ActorAccessor accessor, UserService users, AuditSer
 
     /// <summary>成员选择器检索（任何登录用户，仅返回有限字段）。</summary>
     [HttpGet("users/lookup")]
-    public async Task<object> Lookup([FromQuery] string? q) => await users.LookupAsync(q);
+    public async Task<object> Lookup([FromQuery] string? q) { RequireAdmin(); return await users.LookupAsync(q); }
 
     /// <summary>创建用户 / 服务账号（仅管理员）。</summary>
     [HttpPost("users")]
@@ -87,6 +88,14 @@ public class UsersController(ActorAccessor accessor, UserService users, AuditSer
         return NoContent();
     }
 
+    [HttpPut("users/{id}/workspace")]
+    public async Task<IActionResult> AssignWorkspace(string id, AssignWorkspaceRequest req)
+    {
+        RequireAdmin(); await personal.AssignAsync(Me, id, req.WorkspaceId);
+        await audit.LogAsync(Me, "user.workspace.assign", "User", id, workspaceId: req.WorkspaceId);
+        return NoContent();
+    }
+
     /// <summary>要求平台管理员，且必须是 Web 登录态（Token 不允许做用户管理）。</summary>
     private void RequireAdmin()
     {
@@ -100,7 +109,7 @@ public class AdminController(ActorAccessor accessor, DshDbContext db, Permission
     IEnumerable<IRuntimeProvider> providers, AuditService audit) : ApiBase(accessor)
 {
     /// <summary>平台管理员校验。</summary>
-    private void RequireAdmin() { if (!Me.IsPlatformAdmin) throw ApiException.Forbidden("需要平台管理员权限"); }
+    private void RequireAdmin() { if (!Me.IsPlatformAdmin || Me.Via != "web") throw ApiException.Forbidden("需要平台管理员网页登录"); }
 
     /// <summary>所有 Pool 的 Runtime 状态。</summary>
     [HttpGet("runtimes"), Scope(Scopes.RuntimeRead)]

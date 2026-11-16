@@ -68,6 +68,8 @@ public class PoolsController(ActorAccessor accessor, PermissionEngine engine, Po
     {
         var access = await engine.RequirePoolViewAsync(Me, id);
         var p = await pools.GetActiveAsync(id);
+        if (!Me.IsPlatformAdmin || Me.AllowedWorkspaces.Count > 0)
+            return new { p.Id, p.Name, p.Description, My = new { CanManage = false, CanEditDetails = Me.Via == "web" && await db.PoolMembers.AnyAsync(m => m.PoolId == id && m.UserId == Me.UserId && m.CanEditDetails), access.Source } };
         var graph = await engine.GetGraphAsync();
         var (direct, inherited) = await pools.ListMembersAsync(id);
         var (sd, si, so) = await spaces.ForPoolAsync(id);
@@ -92,9 +94,10 @@ public class PoolsController(ActorAccessor accessor, PermissionEngine engine, Po
     }
 
     /// <summary>更新 Pool。</summary>
-    [HttpPatch("pools/{id}"), Scope(Scopes.PoolManage)]
+    [HttpPatch("pools/{id}"), Scope(Scopes.PoolRead)]
     public async Task<object> Update(string id, UpdatePoolRequest req)
     {
+        if (Me.IsPlatformAdmin) Me.RequireScope(Scopes.PoolManage);
         var p = await pools.UpdateAsync(Me, id, req.Name, req.Description, req.RuntimeProvider, req.InheritConfig);
         await audit.LogAsync(Me, "pool.update", "Pool", id, id, detail: $"更新 Pool「{p.Name}」");
         return new { p.Id, p.Name };
@@ -148,9 +151,21 @@ public class PoolsController(ActorAccessor accessor, PermissionEngine engine, Po
     [HttpGet("pools/{id}/members"), Scope(Scopes.PoolRead)]
     public async Task<object> Members(string id)
     {
-        await engine.RequirePoolViewAsync(Me, id);
+        await engine.RequirePoolManageAsync(Me, id);
         var (direct, inherited) = await pools.ListMembersAsync(id);
         return new { direct, inherited };
+    }
+
+    /// <summary>管理员单独授予 Pool 基本信息编辑权，不能用于配置、成员或结构管理。</summary>
+    [HttpPut("pools/{id}/members/{userId}/details-permission"), Scope(Scopes.PoolManage)]
+    public async Task<IActionResult> DetailsPermission(string id, string userId, DetailsPermissionRequest req)
+    {
+        await engine.RequirePoolManageAsync(Me, id);
+        var member = await db.PoolMembers.FirstOrDefaultAsync(m => m.PoolId == id && m.UserId == userId) ?? throw ApiException.NotFound("请先将用户加入 Pool");
+        member.CanEditDetails = req.CanEditDetails;
+        await db.SaveChangesAsync();
+        await audit.LogAsync(Me, "pool.member.details-permission", "Pool", id, id, detail: $"用户 {userId} 基本信息编辑权：{req.CanEditDetails}");
+        return NoContent();
     }
 
     /// <summary>添加 / 更新直属成员。</summary>
@@ -213,6 +228,7 @@ public class PoolsController(ActorAccessor accessor, PermissionEngine engine, Po
     public async Task<object> SharedSpaces(string id)
     {
         await engine.RequirePoolViewAsync(Me, id);
+        if (!Me.IsPlatformAdmin || Me.AllowedWorkspaces.Count > 0) return new { Direct = await spaces.ListAsync(Me, null, false), Inherited = Array.Empty<object>(), Owned = Array.Empty<object>() };
         var (direct, inherited, owned) = await spaces.ForPoolAsync(id);
         return new { direct, inherited, owned };
     }
@@ -221,7 +237,7 @@ public class PoolsController(ActorAccessor accessor, PermissionEngine engine, Po
     [HttpGet("pools/{id}/policy"), Scope(Scopes.PoolRead)]
     public async Task<object> GetPolicy(string id)
     {
-        await engine.RequirePoolViewAsync(Me, id);
+        await engine.RequirePoolManageAsync(Me, id);
         var p = await pools.GetActiveAsync(id);
         return new { Own = PolicyService.Parse(p.PolicyJson), Effective = await policy.GetEffectiveAsync(id) };
     }
@@ -251,7 +267,7 @@ public class PoolsController(ActorAccessor accessor, PermissionEngine engine, Po
     [HttpGet("pools/{id}/effective-config"), Scope(Scopes.PoolRead)]
     public async Task<object> EffectiveConfig(string id)
     {
-        await engine.RequirePoolViewAsync(Me, id);
+        await engine.RequirePoolManageAsync(Me, id);
         return await config.ResolveAsync(id, null);
     }
 
@@ -261,7 +277,7 @@ public class PoolsController(ActorAccessor accessor, PermissionEngine engine, Po
     [HttpGet("pools/{id}/runtime"), Scope(Scopes.RuntimeRead)]
     public async Task<object> Runtime(string id)
     {
-        await engine.RequirePoolViewAsync(Me, id);
+        await engine.RequirePoolManageAsync(Me, id);
         var pool = await pools.GetActiveAsync(id);
         var rt = await runtime.GetOrCreateAsync(pool);
         return RuntimeView(rt, pool, 0);
@@ -271,7 +287,7 @@ public class PoolsController(ActorAccessor accessor, PermissionEngine engine, Po
     [HttpGet("pools/{id}/runtime/health"), Scope(Scopes.RuntimeRead)]
     public async Task<object> Health(string id)
     {
-        await engine.RequirePoolViewAsync(Me, id);
+        await engine.RequirePoolManageAsync(Me, id);
         var (rt, h) = await runtime.HealthAsync(await pools.GetActiveAsync(id));
         return new { h.Healthy, h.Version, h.Message, h.ActiveRuns, Status = rt.Status.ToString() };
     }

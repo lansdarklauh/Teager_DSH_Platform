@@ -2,7 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { message, Modal } from 'ant-design-vue'
 import { KeyOutlined, PlusOutlined, CopyOutlined, StopOutlined } from '@ant-design/icons-vue'
-import { tokenApi, wsApi, userApi } from '@/api'
+import { tokenApi, wsApi, userApi, spaceApi } from '@/api'
 import { useAuthStore } from '@/stores/auth'
 import { copyText, fmtAgo, fmtTime } from '@/utils/format'
 import PageHeader from '@/components/PageHeader.vue'
@@ -16,12 +16,13 @@ const all = ref(false)
 const open = ref(false)
 const created = ref<any>(null)
 const workspaces = ref<any[]>([])
+const sharedSpaces = ref<any[]>([])
 const services = ref<any[]>([])
 const saving = ref(false)
 const form = ref<any>({})
 
 /** Scope 分组与说明（对应产品方案第 26 节）。 */
-const scopeGroups = [
+const allScopeGroups = [
   { title: 'Pool', items: [['pool:read', '读取 Pool'], ['pool:manage', '管理 Pool']] },
   { title: 'Workspace', items: [['workspace:read', '读取'], ['workspace:write', '写入'], ['workspace:execute', '执行（终端）'], ['workspace:manage', '管理']] },
   { title: 'Session', items: [['session:read', '读取'], ['session:create', '创建'], ['session:execute', '发送消息 / 执行']] },
@@ -29,23 +30,26 @@ const scopeGroups = [
   { title: '共享空间', items: [['share:read', '读取'], ['share:write', '写入'], ['share:manage', '管理']] },
   { title: 'Runtime', items: [['runtime:read', '读取'], ['runtime:manage', '管理']] }
 ]
-const presets = [
+const allPresets = [
   { label: '只读', scopes: ['pool:read', 'workspace:read', 'session:read', 'files:read', 'share:read', 'runtime:read'] },
   { label: 'SDK 会话', scopes: ['workspace:read', 'session:read', 'session:create', 'session:execute', 'files:read', 'files:write'] },
-  { label: '全部', scopes: scopeGroups.flatMap((g) => g.items.map((i) => i[0])) }
+  { label: '全部', scopes: allScopeGroups.flatMap((g) => g.items.map((i) => i[0])) }
 ]
-function blank() { return { name: '', type: 'Personal', scopes: [...presets[1].scopes], allowedPools: [], allowedWorkspaces: [], expiresInDays: 90, expiresInHours: 1, serviceAccountId: undefined } }
+const forbiddenScopes = ['pool:manage', 'workspace:write', 'workspace:manage', 'share:manage', 'runtime:read', 'runtime:manage']
+const scopeGroups = computed(() => allScopeGroups.map(g => ({ ...g, items: g.items.filter(i => auth.isAdmin || !forbiddenScopes.includes(i[0])) })).filter(g => g.items.length))
+const presets = computed(() => allPresets.filter(p => auth.isAdmin || p.label !== '全部').map(p => ({ ...p, scopes: p.scopes.filter(scope => auth.isAdmin || !forbiddenScopes.includes(scope)) })))
+function blank() { return { name: '', type: 'Personal', scopes: [...presets.value[1].scopes], allowedPools: [], allowedWorkspaces: auth.isAdmin ? [] : [auth.user.defaultWorkspaceId], expiresInDays: 90, expiresInHours: 1, serviceAccountId: undefined } }
 
 async function load() { loading.value = true; try { rows.value = (await tokenApi.list(all.value)) as any[] } finally { loading.value = false } }
 async function openCreate() {
-  form.value = blank(); open.value = true
+  form.value = blank(); sharedSpaces.value = await spaceApi.list() as any[]; open.value = true
   workspaces.value = (await wsApi.list()) as any[]
   if (auth.isAdmin) services.value = ((await userApi.list()) as any[]).filter((u) => u.isServiceAccount)
 }
 async function create() {
   saving.value = true
   try {
-    const r: any = await tokenApi.create({ name: form.value.name, type: form.value.type, scopes: form.value.scopes, allowedPools: form.value.allowedPools, allowedWorkspaces: form.value.allowedWorkspaces,
+    const r: any = await tokenApi.create({ name: form.value.name, type: form.value.type, scopes: form.value.scopes, allowedPools: form.value.allowedPools, allowedWorkspaces: form.value.allowedWorkspaces, allowedSharedSpaces: form.value.allowedSharedSpaces || [],
       expiresInDays: form.value.type === 'Temporary' ? undefined : form.value.expiresInDays, expiresInHours: form.value.type === 'Temporary' ? form.value.expiresInHours : undefined, serviceAccountId: form.value.serviceAccountId })
     created.value = r; open.value = false; load()
   } finally { saving.value = false }
@@ -94,9 +98,10 @@ const typeOptions = computed(() => [{ label: '个人 Token', value: 'Personal' }
           </a-checkbox-group>
         </a-form-item>
         <div class="grid grid-2">
-          <a-form-item label="限定 Pool（含其子 Pool；留空不限）"><PoolTreeMultiSelect v-model="form.allowedPools" /></a-form-item>
-          <a-form-item label="限定 Workspace（留空不限）"><a-select v-model:value="form.allowedWorkspaces" mode="multiple" placeholder="选择 Workspace" :options="workspaces.map((w) => ({ value: w.id, label: `${w.name}（${w.poolName}）` }))" option-filter-prop="label" /></a-form-item>
+          <a-form-item v-if="auth.isAdmin" label="限定 Pool（含其子 Pool；留空不限）"><PoolTreeMultiSelect v-model="form.allowedPools" /></a-form-item>
+          <a-form-item label="限定 Workspace（普通用户仅自己的空间）"><a-select v-model:value="form.allowedWorkspaces" mode="multiple" placeholder="选择 Workspace" :options="workspaces.map((w) => ({ value: w.id, label: `${w.name}（${w.poolName}）` }))" option-filter-prop="label" /></a-form-item>
         </div>
+        <a-form-item label="限定共享空间（留空无法通过 Token 访问共享资源）"><a-select v-model:value="form.allowedSharedSpaces" mode="multiple" :options="sharedSpaces.map(s => ({ value: s.id, label: `${s.name}（${s.my?.permission || '只读'}）` }))" option-filter-prop="label" /></a-form-item>
       </a-form>
     </a-modal>
 

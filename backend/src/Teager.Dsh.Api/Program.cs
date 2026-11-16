@@ -15,6 +15,7 @@ using Teager.Dsh.Infrastructure.Data;
 using Teager.Dsh.Infrastructure.Hosting;
 using Teager.Dsh.Infrastructure.Options;
 
+Console.OutputEncoding = System.Text.Encoding.UTF8;
 var builder = WebApplication.CreateBuilder(args);
 
 // ── 日志：控制台 + 按天滚动文件（日志目录可独立挂载卷，默认保留 14 天）──
@@ -32,7 +33,7 @@ var dsh = builder.Configuration.GetSection(DshOptions.SectionName).Get<DshOption
 builder.Services.AddControllers(o => o.Filters.Add(new AuthorizeFilter()))
     .AddJsonOptions(o =>
     {
-        o.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter());
+        o.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter(allowIntegerValues: false));
         o.JsonSerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
         o.JsonSerializerOptions.DictionaryKeyPolicy = JsonNamingPolicy.CamelCase;
         o.JsonSerializerOptions.DefaultIgnoreCondition = JsonIgnoreCondition.Never;
@@ -45,7 +46,9 @@ builder.Services.AddAuthorization();
 builder.Services.Configure<ForwardedHeadersOptions>(o =>
 {
     o.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto | ForwardedHeaders.XForwardedHost;
-    o.KnownIPNetworks.Clear(); o.KnownProxies.Clear(); // 部署在反向代理（nginx / Teager_DevOps 网关）之后，信任其转发头
+    // Preserve loopback defaults; accept additional proxies only when explicitly configured.
+    foreach (var proxy in dsh.Platform.TrustedProxies)
+        o.KnownProxies.Add(System.Net.IPAddress.Parse(proxy));
 });
 
 // ── 限流：按 Token / 用户 / IP 分区；登录接口按 IP 单独限制 ──
@@ -56,7 +59,8 @@ builder.Services.AddRateLimiter(o =>
     o.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(ctx =>
     {
         if (dsh.RateLimit.PermitPerMinute <= 0 || ctx.Request.Path.StartsWithSegments("/health")) return RateLimitPartition.GetNoLimiter("none");
-        var key = ctx.Request.Headers.Authorization.ToString() is { Length: > 12 } a ? "t:" + a[^12..] : ctx.Request.Cookies.TryGetValue(PlatformAuth.CookieName, out var c) ? "c:" + c[..Math.Min(12, c.Length)] : "ip:" + ctx.Connection.RemoteIpAddress;
+        var actor = ctx.RequestServices.GetRequiredService<ActorAccessor>().Current;
+        var key = actor == null ? "ip:" + ctx.Connection.RemoteIpAddress : "u:" + actor.UserId;
         return RateLimitPartition.GetFixedWindowLimiter(key, _ => new FixedWindowRateLimiterOptions { PermitLimit = dsh.RateLimit.PermitPerMinute, Window = TimeSpan.FromMinutes(1) });
     });
     o.AddPolicy("login", ctx => RateLimitPartition.GetFixedWindowLimiter("login:" + ctx.Connection.RemoteIpAddress, _ => new FixedWindowRateLimiterOptions { PermitLimit = Math.Max(1, dsh.RateLimit.LoginPerMinute), Window = TimeSpan.FromMinutes(1) }));
@@ -70,14 +74,16 @@ Log.Information("DSH 平台启动：数据目录 {Data}，日志目录 {Logs}，
 
 await DbInitializer.InitializeAsync(app.Services);
 
-app.UseForwardedHeaders();
+if (dsh.Platform.TrustedProxies.Length > 0) app.UseForwardedHeaders();
+app.UseWebSockets();
+app.UseMiddleware<ApplicationPreviewMiddleware>();
 app.UseMiddleware<GatewayMiddleware>();
 if (dsh.Platform.CorsOrigins.Length > 0) app.UseCors();
 app.UseMiddleware<SnakeCaseRequestMiddleware>();
-app.UseWebSockets();
 app.UseAuthentication();
 app.UseRateLimiter();
 app.UseAuthorization();
+app.UseMiddleware<SandboxFileMiddleware>();
 app.MapControllers();
 
 // 健康检查：live 不依赖外部组件；ready 校验数据库连通

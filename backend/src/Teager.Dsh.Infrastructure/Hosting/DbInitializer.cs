@@ -22,6 +22,8 @@ public static class DbInitializer
         var log = scope.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger("DbInitializer");
 
         if (opt.Platform.AutoMigrate) await db.Database.MigrateAsync();
+        await scope.ServiceProvider.GetRequiredService<PlatformLease>().AcquireAsync(db);
+        if (await db.Organizations.CountAsync() > 1) throw new InvalidOperationException("当前部署只支持单组织，不能混用多个组织的数据");
         if (!await db.Organizations.AnyAsync())
             db.Organizations.Add(new Organization { Id = IdGen.New("org"), Name = opt.Seed.OrganizationName });
         if (!await db.RuntimeNodes.AnyAsync())
@@ -47,7 +49,15 @@ public static class DbInitializer
         foreach (var rt in await db.Runtimes.Where(r => r.Status != RuntimeStatus.STOPPED && r.Status != RuntimeStatus.MAINTENANCE).ToListAsync()) rt.Status = RuntimeStatus.STOPPED;
         await db.SaveChangesAsync();
         if (stale.Count > 0) log.LogWarning("已将 {N} 条中断的运行标记为失败", stale.Count);
+        await FileTrash.RecoverAsync(scope.ServiceProvider.GetRequiredService<StoragePaths>(), db);
 
         if (opt.Seed.DemoData) await DemoSeeder.SeedAsync(db, scope.ServiceProvider.GetRequiredService<StoragePaths>(), log);
+        var credentials = await scope.ServiceProvider.GetRequiredService<Services.ModelCredentialMigration>().NormalizeAsync();
+        if (credentials > 0) log.LogInformation("已将 {N} 个旧模型配置中的上游密钥迁移至同层级加密存储", credentials);
+        var personal = scope.ServiceProvider.GetRequiredService<Services.PersonalWorkspaceService>();
+        foreach (var id in await db.Users.Where(u => u.Role == PlatformRole.User && !u.IsServiceAccount).Select(u => u.Id).ToListAsync())
+            await personal.EnsureAsync(id);
+        var synchronized = await personal.SynchronizePoolProviderAsync();
+        if (synchronized > 0) log.LogInformation("已将 {N} 个系统个人 Pool 同步为默认引擎 {Provider}；保留模型、密钥和历史消息", synchronized, opt.Runtime.DefaultProvider);
     }
 }

@@ -95,7 +95,7 @@ public class PermissionEngine(DshDbContext db, IMemoryCache cache, PermissionCac
     /// <param name="graph">Pool 图。</param>
     private static bool TokenCoversWorkspace(Actor actor, Workspace ws, PoolGraph graph)
     {
-        if (actor.AllowedPools.Count == 0 && actor.AllowedWorkspaces.Count == 0) return true;
+        if (!actor.ResourceRestricted) return true;
         if (actor.AllowedWorkspaces.Contains(ws.Id)) return true;
         return actor.AllowedPools.Count > 0 && TokenCoversPool(actor, ws.PoolId, graph);
     }
@@ -110,19 +110,27 @@ public class PermissionEngine(DshDbContext db, IMemoryCache cache, PermissionCac
         if (!graph.Nodes.ContainsKey(poolId)) return new PoolAccess(false, false, null, "none", null);
         if (actor.AllowedPools.Count > 0 && !TokenCoversPool(actor, poolId, graph))
             return new PoolAccess(false, false, null, "none", null);
-        if (actor.IsPlatformAdmin) return new PoolAccess(true, true, PoolRole.Owner, "platform-admin", null);
+        if (actor.AllowedPools.Count == 0 && actor.ResourceRestricted)
+        {
+            if (actor.AllowedWorkspaces.Count == 0 || !await db.Workspaces.AnyAsync(w => actor.AllowedWorkspaces.Contains(w.Id) && w.PoolId == poolId))
+                return new PoolAccess(false, false, null, "token-scope", null);
+            return new PoolAccess(true, false, null, "token-workspace", null);
+        }
+        if (actor.IsPlatformAdmin && !actor.IsServiceAccount) return new PoolAccess(true, !actor.ResourceRestricted, PoolRole.Owner, "platform-admin", null);
 
         var roles = await GetDirectRolesAsync(actor.UserId);
         roles.TryGetValue(poolId, out var direct);
         var hasDirect = roles.ContainsKey(poolId);
-        if (hasDirect && direct >= PoolRole.Admin) return new PoolAccess(true, true, direct, "direct", poolId);
+        if (hasDirect && direct >= PoolRole.Admin) return new PoolAccess(true, false, direct, "direct", poolId);
 
         // 祖先 Pool 的管理员可向下委托管理子 Pool（仅管理权，不含私有资源的数据访问权）
         foreach (var a in graph.AncestorsOf(poolId))
             if (roles.TryGetValue(a, out var ar) && ar >= PoolRole.Admin)
-                return new PoolAccess(true, true, hasDirect ? direct : null, "ancestor-admin", a);
+                return new PoolAccess(true, false, hasDirect ? direct : null, "ancestor-member", a);
 
         if (hasDirect) return new PoolAccess(true, false, direct, "direct", poolId);
+        if (await db.Workspaces.AnyAsync(w => w.PoolId == poolId && w.AssignedUserId == actor.UserId && w.Status == WorkspaceStatus.Active))
+            return new PoolAccess(true, false, null, "personal-workspace", poolId);
 
         // 子 Pool 的成员可以看到祖先 Pool（用于展示层级与继承资源）
         foreach (var d in graph.DescendantsOf(poolId))
@@ -161,6 +169,7 @@ public class PermissionEngine(DshDbContext db, IMemoryCache cache, PermissionCac
     /// <param name="poolId">Pool ID。</param>
     public async Task<PoolAccess> RequirePoolManageAsync(Actor actor, string poolId)
     {
+        actor.RequirePlatformAdmin();
         var a = await RequirePoolViewAsync(actor, poolId);
         if (!a.CanManage) throw ApiException.Forbidden("需要该 Pool 的管理员权限");
         return a;
@@ -186,30 +195,12 @@ public class PermissionEngine(DshDbContext db, IMemoryCache cache, PermissionCac
             return new WorkspaceAccess(null, true, "explicit-deny", null, [wsName]);
         if (actor.IsPlatformAdmin)
             return new WorkspaceAccess(WorkspaceRole.Admin, false, "platform-admin", null, ["平台管理员", wsName]);
-        if (explicitRow != null)
-            return new WorkspaceAccess(explicitRow.Role, false, "workspace-member", null, [wsName]);
-
-        if (!ws.InheritPoolMembers) return new WorkspaceAccess(null, false, "none", null, []);
-
-        var roles = await GetDirectRolesAsync(actor.UserId);
-        if (roles.TryGetValue(ws.PoolId, out var direct))
-            return new WorkspaceAccess((WorkspaceRole)(int)direct, false, "pool-direct", ws.PoolId, [graph.NameOf(ws.PoolId), wsName]);
-
-        // 继承：用户属于 Workspace 所属 Pool 的某个后代 Pool，则成为其“有效成员”，角色最高为 Member
-        string? via = null; PoolRole best = PoolRole.Viewer; var found = false;
-        foreach (var d in graph.DescendantsOf(ws.PoolId))
-        {
-            if (!roles.TryGetValue(d, out var r)) continue;
-            if (!found || r > best) { best = r; via = d; found = true; }
-        }
-        if (found)
-        {
-            var capped = (WorkspaceRole)Math.Min((int)best, (int)WorkspaceRole.Member);
-            var path = graph.PathNames(ws.PoolId, via!);
-            path.Add(wsName);
-            return new WorkspaceAccess(capped, false, "pool-inherited", via, path);
-        }
-        return new WorkspaceAccess(null, false, "none", null, []);
+        if (actor.IsServiceAccount)
+            return explicitRow == null ? new WorkspaceAccess(null, false, "none", null, [])
+                : new WorkspaceAccess((WorkspaceRole)Math.Min((int)explicitRow.Role, (int)WorkspaceRole.Member), false, "workspace-member", null, [wsName]);
+        if (ws.AssignedUserId != actor.UserId)
+            return new WorkspaceAccess(null, false, "not-assigned", null, []);
+        return new WorkspaceAccess(WorkspaceRole.Member, false, "personal-workspace", null, [wsName]);
     }
 
     /// <summary>判断用户能否管理 Workspace 元数据（改名、成员、挂载、删除）：平台管理员 / Workspace Admin 以上 / 所属 Pool 管理者。</summary>
@@ -218,6 +209,7 @@ public class PermissionEngine(DshDbContext db, IMemoryCache cache, PermissionCac
     /// <param name="wa">已计算的访问结果。</param>
     public async Task<bool> CanManageWorkspaceAsync(Actor actor, Workspace ws, WorkspaceAccess wa)
     {
+        if (!actor.IsPlatformAdmin || actor.IsServiceAccount || actor.ResourceRestricted) return false;
         if (wa.Denied || wa.Source == "token-scope") return false; // Token 白名单未覆盖：连“仅管理可见”也不允许，避免通过 Pool 管理权绕过白名单
         if (wa.Role >= WorkspaceRole.Admin) return true;
         return (await GetPoolAccessAsync(actor, ws.PoolId)).CanManage;
@@ -238,6 +230,7 @@ public class PermissionEngine(DshDbContext db, IMemoryCache cache, PermissionCac
         if (wa.Denied || !visible) throw ApiException.NotFound("Workspace 不存在或无权访问");
         if (manage && !canManage) throw ApiException.Forbidden("需要 Workspace 管理员权限");
         if (min != null && (wa.Role == null || wa.Role < min)) throw ApiException.Forbidden("当前角色无权执行该操作");
+        if (min >= WorkspaceRole.Member && ws.Status != WorkspaceStatus.Active) throw ApiException.Conflict("Workspace 已归档，不能执行写入或任务");
         return (ws, wa);
     }
 
@@ -287,6 +280,9 @@ public class PermissionEngine(DshDbContext db, IMemoryCache cache, PermissionCac
     public async Task<SpaceAccess> GetUserSpaceAccessAsync(Actor actor, SharedSpace space)
     {
         var notes = new List<string>();
+        if ((space.Status != SharedSpaceStatus.Active && !actor.IsPlatformAdmin) || (actor.Via == "token" && (!actor.HasScope(Scopes.ShareRead)
+            || (actor.ResourceRestricted && !actor.AllowedSharedSpaces.Contains(space.Id)))))
+            return new SpaceAccess(null, "token-scope", null, null, [], []);
         var graph = await GetGraphAsync();
         if (actor.AllowedPools.Count > 0 && space.OwnerPoolId != null && !TokenCoversPool(actor, space.OwnerPoolId, graph))
             return new SpaceAccess(null, "token-scope", null, null, [], ["Token 的 Pool 白名单未覆盖该共享空间所属 Pool"]);
@@ -317,7 +313,7 @@ public class PermissionEngine(DshDbContext db, IMemoryCache cache, PermissionCac
         }
         else if (poolBest != null)
         {
-            basePerm = poolBest.Permission; source = poolBest.Source == "direct" ? "pool-direct" : "pool-inherited";
+            basePerm = actor.IsPlatformAdmin ? poolBest.Permission : SharePermission.RO; source = poolBest.Source == "direct" ? "pool-direct" : "pool-inherited";
             via = poolBest.ViaPoolId; grantId = poolBest.GrantId; path = poolBest.Path;
             notes.Add(poolBest.Source == "direct"
                 ? $"通过所属 Pool「{graph.NameOf(poolBest.ViaPoolId)}」的直接授权获得 {poolBest.Permission}"
@@ -329,14 +325,13 @@ public class PermissionEngine(DshDbContext db, IMemoryCache cache, PermissionCac
         SharePermission? managePerm = null; string? manageSource = null;
         if (actor.IsPlatformAdmin) { managePerm = SharePermission.MANAGE; manageSource = "platform-admin"; }
         // 仅“所属 Pool 的直属管理员”拥有管理权；祖先 Pool 管理员的委托管理不包含子 Pool 私有资源（父不自动获得子的私有资源）
-        else if (space.OwnerPoolId != null && (await GetPoolAccessAsync(actor, space.OwnerPoolId)) is { DirectRole: >= PoolRole.Admin }) { managePerm = SharePermission.MANAGE; manageSource = "owner-pool-admin"; }
-        else if (space.CreatedBy == actor.UserId) { managePerm = SharePermission.MANAGE; manageSource = "creator"; }
 
         if (managePerm != null && (basePerm == null || managePerm > basePerm))
         {
             notes.Add(manageSource switch { "platform-admin" => "平台管理员拥有全部管理权限", "owner-pool-admin" => "所属 Pool 管理员拥有管理权限", _ => "创建人拥有管理权限" });
             return new SpaceAccess(managePerm, manageSource!, via, grantId, path, notes);
         }
+        if (!actor.IsPlatformAdmin && basePerm > SharePermission.RW) basePerm = SharePermission.RW;
         return new SpaceAccess(basePerm, source, via, grantId, path, notes);
     }
 
@@ -350,6 +345,9 @@ public class PermissionEngine(DshDbContext db, IMemoryCache cache, PermissionCac
     public async Task<SpaceAccess> GetWorkspaceSpaceAccessAsync(Actor actor, Workspace ws, WorkspaceAccess wa, SharedSpace space, WorkspaceSharedSpaceMount? mount)
     {
         var notes = new List<string>();
+        if (wa.Role == null || wa.Denied || space.Status != SharedSpaceStatus.Active || mount is { Enabled: false }
+            || (actor.Via == "token" && (!actor.HasScope(Scopes.ShareRead) || (actor.ResourceRestricted && !actor.AllowedSharedSpaces.Contains(space.Id)))))
+            return new SpaceAccess(null, "not-allowed", null, null, [], []);
         var graph = await GetGraphAsync();
         var map = await GetPoolSharedSpacesAsync(ws.PoolId);
         if (!map.TryGetValue(space.Id, out var psa))
@@ -357,7 +355,7 @@ public class PermissionEngine(DshDbContext db, IMemoryCache cache, PermissionCac
         if (psa.Denied)
             return new SpaceAccess(null, "explicit-deny", psa.ViaPoolId, psa.GrantId, psa.Path, ["Pool 链路上存在显式拒绝"]);
 
-        var perm = psa.Permission!.Value;
+        var perm = actor.IsPlatformAdmin ? psa.Permission!.Value : SharePermission.RO;
         notes.Add(psa.Source == "direct"
             ? $"Pool「{graph.NameOf(psa.ViaPoolId)}」直接授权 {perm}"
             : $"祖先 Pool「{graph.NameOf(psa.ViaPoolId)}」向下继承授权 {perm}");
@@ -369,6 +367,8 @@ public class PermissionEngine(DshDbContext db, IMemoryCache cache, PermissionCac
             return new SpaceAccess(null, "explicit-deny", null, userGrant.First(g => g.Effect == GrantEffect.Deny).Id, [], ["用户被显式拒绝访问该共享空间"]);
         var ua = userGrant.FirstOrDefault(g => g.Effect == GrantEffect.Allow);
         if (ua != null) { perm = ua.Permission; source = "user-grant"; notes.Add($"用户级显式授权覆盖为 {perm}"); }
+        if (!actor.IsPlatformAdmin && perm > SharePermission.RW) perm = SharePermission.RW;
+        if (actor.Via == "token" && !actor.HasScope(Scopes.ShareWrite) && perm > SharePermission.RO) perm = SharePermission.RO;
 
         if (mount?.PermissionOverride != null && mount.PermissionOverride < perm)
         {

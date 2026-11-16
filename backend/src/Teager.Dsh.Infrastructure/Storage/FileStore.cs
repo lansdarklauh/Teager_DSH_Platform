@@ -135,6 +135,8 @@ public static class FileStore
     {
         if (Normalize(relative).Length == 0) throw ApiException.BadRequest("不能删除根目录");
         var full = Resolve(root, relative);
+        if (full.Equals(System.IO.Path.GetFullPath(root).TrimEnd(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar), OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
+            throw ApiException.BadRequest("不能删除根目录");
         if (Directory.Exists(full)) Directory.Delete(full, true);
         else if (File.Exists(full)) File.Delete(full);
         else throw ApiException.NotFound("文件或目录不存在");
@@ -148,6 +150,9 @@ public static class FileStore
     {
         if (Normalize(from).Length == 0 || Normalize(to).Length == 0) throw ApiException.BadRequest("路径不能为空");
         var src = Resolve(root, from); var dst = Resolve(root, to);
+        var rootFull = System.IO.Path.GetFullPath(root).TrimEnd(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar);
+        var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        if (src.Equals(rootFull, comparison) || dst.Equals(rootFull, comparison)) throw ApiException.BadRequest("不能移动根目录");
         if (File.Exists(dst) || Directory.Exists(dst)) throw ApiException.Conflict("目标已存在");
         Directory.CreateDirectory(System.IO.Path.GetDirectoryName(dst)!);
         if (Directory.Exists(src))

@@ -12,6 +12,10 @@ import { wsApi, sessionApi, poolApi } from '@/api'
 import { fmtAgo, fmtShort } from '@/utils/format'
 import Tags from '@/components/Tags.vue'
 import FileManager from '@/components/FileManager.vue'
+import ProjectsPanel from '@/components/ProjectsPanel.vue'
+import ProjectMentionInput from '@/components/ProjectMentionInput.vue'
+import type { ProjectReference } from '@/utils/projectMentions'
+import ProcessesPanel from '@/components/ProcessesPanel.vue'
 import TerminalPanel from '@/components/TerminalPanel.vue'
 import EventTimeline from '@/components/EventTimeline.vue'
 
@@ -29,16 +33,22 @@ const keyword = ref('')
 const session = ref<any>(null)
 const messages = ref<any[]>([])
 const input = ref('')
+const referencedProjects = ref<ProjectReference[]>([])
+const projectComposer = ref<any>()
 const modelKey = ref<string>('')
 const rightOpen = ref(true)
 const rightTab = ref('files')
 const fm = ref<any>(null)
+const projectPath = ref('')
+function openProject(path: string) { projectPath.value = path; rightOpen.value = true; rightTab.value = 'files' }
 const listEl = ref<HTMLElement>()
 
 /** 当前运行的实时状态；run_end 后保留事件供“工具 / 进度”面板查看最近一次运行。 */
 const live = reactive({ running: false, runId: '', text: '', thinking: '', events: [] as any[], error: '', alerts: [] as any[] })
 let lastSeq = 0
 let ctrl: AbortController | null = null
+let reconnect: ReturnType<typeof setTimeout> | undefined
+let disposed = false
 
 const v = computed(() => wsData.value?.view)
 const role = computed(() => v.value?.myRole)
@@ -47,7 +57,7 @@ const models = computed(() => config.value.filter((c) => c.kind === 'Model' && c
 const skills = computed(() => config.value.filter((c) => c.kind === 'Skill' && c.enabled))
 const mcps = computed(() => config.value.filter((c) => c.kind === 'Mcp' && c.enabled))
 const fileAreas = computed(() => [{ value: 'files', label: '私有文件' }, ...mounts.value.filter((m) => m.active).map((m) => ({ value: `shared/${m.mountName}`, label: `共享：${m.mountName}`, hint: `${m.sharedSpaceName} · ${m.effectivePermission}` }))])
-const terminalReason = computed(() => (!wsData.value?.terminalAllowed || !wsData.value?.policy?.allowTerminal ? '终端已被平台或 Pool 策略禁用' : role.value === 'Viewer' ? '只读角色不能使用终端' : ''))
+const terminalReason = computed(() => role.value === 'Viewer' ? '只读角色不能使用终端' : wsData.value?.sandboxEnabled === false ? '平台尚未启用个人隔离环境，请联系管理员统一配置' : !wsData.value?.policy?.allowTerminal ? '终端已被平台或 Pool 策略禁用' : !wsData.value?.terminalAllowed ? '个人隔离环境未就绪，请联系管理员检查运行配置' : '')
 const toolCount = computed(() => live.events.filter((e) => e.type === 'tool_call').length)
 
 async function loadWorkspace() {
@@ -67,13 +77,13 @@ async function loadSession() {
   scrollDown()
   if (r.session.running) attach(lastSeq)
 }
-watch(wsId, async () => { await loadWorkspace(); await loadSessions() }, { immediate: true })
+watch(wsId, async () => { input.value = ''; referencedProjects.value = []; await loadWorkspace(); await loadSessions() }, { immediate: true })
 watch(sid, loadSession, { immediate: true })
 let kwTimer: any
 watch(keyword, () => { clearTimeout(kwTimer); kwTimer = setTimeout(loadSessions, 300) })
 
 // ── SSE（fetch 流式，携带 Cookie） ──
-function stopStream() { ctrl?.abort(); ctrl = null }
+function stopStream() { clearTimeout(reconnect); ctrl?.abort(); ctrl = null }
 async function attach(after: number) {
   stopStream()
   const c = new AbortController(); ctrl = c
@@ -94,10 +104,11 @@ async function attach(after: number) {
       }
     }
   } catch (e: any) { if (e.name !== 'AbortError') live.error = e.message } finally {
-    if (ctrl === c) { ctrl = null; if (live.running) { live.running = false; refreshAfterRun() } }
+    if (ctrl === c) { ctrl = null; if (live.running && !disposed) { reconnect = setTimeout(async () => { try { const r: any = await sessionApi.get(sid.value); if (r.session.running) attach(lastSeq); else { const missed = await sessionApi.history(sid.value, undefined, lastSeq) as any[]; missed.forEach(handle); live.running = false; await refreshAfterRun() } } catch { live.running = false; live.error = '连接已中断，请刷新页面恢复任务结果' } }, 1500) } }
   }
 }
 function handle(e: any) {
+  if (e.seq && e.seq <= lastSeq) return
   lastSeq = Math.max(lastSeq, e.seq || 0)
   live.events.push(e)
   switch (e.type) {
@@ -125,19 +136,19 @@ function openSession(id: string) { if (id !== sid.value) router.push(`/w/${wsId.
 async function send() {
   const text = input.value.trim()
   if (!text || live.running || !canSend.value) return
+  const projects = [...referencedProjects.value]
   let id = sid.value
-  if (!id) { const s: any = await sessionApi.create({ workspaceId: wsId.value, model: modelKey.value || undefined }); id = s.id; session.value = s; lastSeq = 0; skipLoad = true; await router.push(`/w/${wsId.value}/s/${id}`); loadSessions() }
-  input.value = ''
-  messages.value.push({ id: 'tmp' + Date.now(), role: 'user', content: text, createdAt: new Date().toISOString() })
   Object.assign(live, { running: true, text: '', thinking: '', events: [], error: '', alerts: [] })
-  scrollDown()
   try {
-    await sessionApi.send(id, text, modelKey.value || undefined)
+    if (!id) { const s: any = await sessionApi.create({ workspaceId: wsId.value, model: modelKey.value || undefined }); id = s.id; session.value = s; lastSeq = 0; skipLoad = true; await router.push(`/w/${wsId.value}/s/${id}`); loadSessions() }
+    messages.value.push({ id: 'tmp' + Date.now(), role: 'user', content: text, projects, createdAt: new Date().toISOString() })
+    scrollDown()
+    await sessionApi.send(id, text, modelKey.value || undefined, projects.map(p => p.id))
+    input.value = ''; referencedProjects.value = []
     attach(lastSeq)
-  } catch (e: any) { live.running = false; live.error = e.friendly || '发送失败'; messages.value = (await sessionApi.messages(id)) as any[] }
+  } catch (e: any) { live.running = false; live.error = e.friendly || '发送失败'; input.value = text; referencedProjects.value = projects; if (id) messages.value = (await sessionApi.messages(id)) as any[] }
 }
 async function cancel() { await sessionApi.cancel(sid.value); message.info('已发送取消请求') }
-function onKey(e: KeyboardEvent) { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send() } }
 async function changeModel(v: string) { modelKey.value = v || ''; if (sid.value) await sessionApi.update(sid.value, { model: modelKey.value }) }
 
 const ren = ref({ open: false, id: '', title: '' })
@@ -154,9 +165,9 @@ const runDrawer = ref<any>({ open: false, events: [], loading: false, title: '' 
 async function openRun(m: any) { runDrawer.value = { open: true, events: [], loading: true, title: '执行过程' }; try { runDrawer.value.events = (await sessionApi.history(sid.value, m.runId)) as any[] } finally { runDrawer.value.loading = false } }
 
 const md = (t: string) => DOMPurify.sanitize(marked.parse(t || '', { async: false }) as string)
-const suggestions = ['列出当前 Workspace 里有哪些文件', '阅读 shared/ 下的资料并给出摘要', '在 files/ 下创建 README.md，写一份项目说明', '检查目录结构，指出可以改进的地方']
+const suggestions = ['列出个人文件区里有哪些文件', '阅读我有权限的共享资料并给出摘要', '在当前项目目录创建 README.md，写一份项目说明', '检查当前项目目录结构，指出可以改进的地方']
 function useSuggestion(s: string) { input.value = s }
-onBeforeUnmount(stopStream)
+onBeforeUnmount(() => { disposed = true; stopStream(); clearTimeout(kwTimer) })
 </script>
 
 <template>
@@ -164,10 +175,11 @@ onBeforeUnmount(stopStream)
     <!-- 左：会话列表 -->
     <aside class="left">
       <div class="lh">
-        <div class="ws-name" @click="router.push(`/workspaces/${wsId}`)"><span class="chip sm" data-mod="ws"><FolderOpenOutlined /></span><div class="ellipsis"><b class="ellipsis">{{ v.name }}</b><div class="muted small ellipsis">{{ v.poolName }}</div></div></div>
+        <div class="ws-name" @click="rightOpen = true"><span class="chip sm" data-mod="ws"><FolderOpenOutlined /></span><div class="ellipsis"><b class="ellipsis">{{ v.name }}</b><div class="muted small ellipsis">{{ v.poolName }}</div></div></div>
         <a-button v-if="canSend" type="primary" block style="margin-top: 14px" @click="newSession"><PlusOutlined /> 新建会话</a-button>
         <a-input v-model:value="keyword" allow-clear placeholder="搜索会话…" style="margin-top: 12px" />
       </div>
+      <div class="wb-projects"><ProjectsPanel :workspace-id="wsId" :reference-disabled="!canSend || live.running" @open-files="openProject" @reference="projectComposer?.add($event)" @changed="projectComposer?.refresh()" /></div>
       <div class="sl">
         <div v-for="s in sessions" :key="s.id" class="si" :class="{ on: s.id === sid }" @click="openSession(s.id)">
           <span class="chip sm"><MessageOutlined /></span>
@@ -205,7 +217,7 @@ onBeforeUnmount(stopStream)
         <div v-if="!messages.length && !live.running" class="welcome">
           <span class="chip lg solid"><RobotOutlined /></span>
           <h2>开始一段 Agent 对话</h2>
-          <p class="muted">Agent 的工作目录是本 Workspace：私有文件在 <span class="mono">files/</span>，挂载的共享空间在 <span class="mono">shared/</span>。</p>
+          <p class="muted">在这里处理当前工作空间的项目与文件。输入 @ 引用项目，Agent 将优先在该项目目录中开展任务；共享资料按你的授权访问。</p>
           <div v-if="canSend" class="sugg"><div v-for="s in suggestions" :key="s" class="card hover" @click="useSuggestion(s)">{{ s }}</div></div>
           <a-alert v-else type="info" show-icon message="你在该 Workspace 是只读角色，可以查看会话与文件，不能发送消息。" />
         </div>
@@ -213,6 +225,7 @@ onBeforeUnmount(stopStream)
         <div v-for="m in messages" :key="m.id" class="m" :class="m.role">
           <span class="av"><UserOutlined v-if="m.role === 'user'" /><RobotOutlined v-else /></span>
           <div class="bubble">
+            <div v-if="m.projects?.length" class="row-wrap" style="margin-bottom: 8px"><a-tag v-for="project in m.projects" :key="project.id" :title="project.directory">@{{ project.name }}</a-tag></div>
             <div v-if="m.role === 'user'" style="white-space: pre-wrap">{{ m.content }}</div>
             <div v-else-if="m.role === 'assistant'" class="md" v-html="md(m.content)" />
             <div v-else class="sys">{{ m.content }}</div>
@@ -234,7 +247,7 @@ onBeforeUnmount(stopStream)
 
       <footer class="cf">
         <div class="box" :class="{ off: !canSend }">
-          <a-textarea v-model:value="input" :auto-size="{ minRows: 1, maxRows: 8 }" :bordered="false" :disabled="!canSend" placeholder="向 Agent 描述任务…（Enter 发送，Shift+Enter 换行）" @keydown="onKey" />
+          <ProjectMentionInput ref="projectComposer" v-model="input" v-model:projects="referencedProjects" :workspace-id="wsId" :disabled="!canSend || live.running" @send="send" />
           <div class="row" style="padding: 0 10px 8px">
             <span class="muted small">{{ canSend ? '所有操作限定在当前 Workspace 内，并受沙箱与共享空间权限约束' : '当前角色不能发送消息' }}</span><span class="spacer" />
             <a-button v-if="live.running" danger @click="cancel"><StopOutlined /> 停止</a-button>
@@ -247,9 +260,10 @@ onBeforeUnmount(stopStream)
     <!-- 右：工具面板 -->
     <aside v-show="rightOpen" class="right">
       <a-tabs v-model:active-key="rightTab" size="small" class="rt" :destroy-inactive-tab-pane="false">
-        <a-tab-pane key="files"><template #tab><FolderOpenOutlined /> 文件</template><div class="pane"><FileManager ref="fm" :base="`/workspaces/${wsId}`" :areas="fileAreas" :can-write="canSend" /></div></a-tab-pane>
+        <a-tab-pane key="files"><template #tab><FolderOpenOutlined /> 文件</template><div class="pane"><FileManager :initial-path="projectPath" ref="fm" :base="`/workspaces/${wsId}`" :areas="fileAreas" :can-write="canSend" /></div></a-tab-pane>
         <a-tab-pane key="terminal"><template #tab><CodeOutlined /> 终端</template><div class="pane"><TerminalPanel :workspace-id="wsId" :allowed="!terminalReason" :reason="terminalReason" /></div></a-tab-pane>
         <a-tab-pane key="plan"><template #tab><ProfileOutlined /> 进度</template><div class="pane"><div class="muted small" style="margin-bottom: 12px">最近一次运行的执行进度与 Token 用量</div><EventTimeline :events="live.events" mode="plan" /></div></a-tab-pane>
+        <a-tab-pane key="processes" tab="进程 / 应用"><ProcessesPanel :workspace-id="wsId" /></a-tab-pane>
         <a-tab-pane key="tools"><template #tab><ToolOutlined /> 工具<span v-if="toolCount" class="tag ws" style="margin-left: 4px">{{ toolCount }}</span></template><div class="pane"><EventTimeline :events="live.events" mode="tools" /></div></a-tab-pane>
         <a-tab-pane key="skills"><template #tab><ThunderboltOutlined /> 技能</template>
           <div class="pane">
@@ -282,6 +296,7 @@ onBeforeUnmount(stopStream)
 .left { background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
 .lh { padding: 18px 16px 14px; border-bottom: 1px solid var(--border); }
 .ws-name { display: flex; align-items: center; gap: 12px; cursor: pointer; }
+.wb-projects { max-height: 32vh; overflow: auto; border-bottom: 1px solid var(--border); }
 .sl { flex: 1; overflow: auto; padding: 10px; }
 .si { display: flex; align-items: center; gap: 10px; padding: 10px; border-radius: 12px; cursor: pointer; margin-bottom: 4px; }
 .si:hover { background: var(--admin-soft); }

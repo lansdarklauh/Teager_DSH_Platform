@@ -51,6 +51,7 @@ public class PlatformAuthHandler(IOptionsMonitor<AuthenticationSchemeOptions> op
             actor = await tokens.ValidateAsync(header["Bearer ".Length..].Trim(), ip);
             if (actor == null) return AuthenticateResult.Fail("Token 无效、已过期或已被吊销");
         }
+        else if (!string.IsNullOrEmpty(header)) return AuthenticateResult.Fail("不支持的认证方式");
         else if (Request.Cookies.TryGetValue(PlatformAuth.CookieName, out var cookie) && !string.IsNullOrEmpty(cookie))
         {
             var user = await auth.ValidateSessionAsync(cookie);
@@ -105,7 +106,7 @@ public class GatewayMiddleware(RequestDelegate next, ILogger<GatewayMiddleware> 
             var m = ctx.Request.Method;
             var unsafeMethod = !(HttpMethods.IsGet(m) || HttpMethods.IsHead(m) || HttpMethods.IsOptions(m));
             if (unsafeMethod && ctx.Request.Path.StartsWithSegments("/api") && ctx.Request.Cookies.ContainsKey(PlatformAuth.CookieName)
-                && !ctx.Request.Headers.ContainsKey("Authorization")
+                && !ctx.Request.Headers.Authorization.ToString().StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)
                 && ctx.Request.Headers[PlatformAuth.CsrfHeader] != PlatformAuth.CsrfValue)
                 throw ApiException.Forbidden("缺少 CSRF 校验头");
             await next(ctx);

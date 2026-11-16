@@ -64,7 +64,7 @@ public record WriteFileRequest(string Path, string Content);
 
 /// <summary>Workspace 管理：CRUD、成员、共享空间挂载、快照 / 克隆、文件、权限解释、终端。</summary>
 public class WorkspacesController(ActorAccessor accessor, PermissionEngine engine, WorkspaceService workspaces, AuditService audit, DshDbContext db, PolicyService policy,
-    ConfigService config, FileAccessService files, RuntimeManager runtime, RuntimeMaterializer materializer, StoragePaths paths, Microsoft.Extensions.Options.IOptions<Teager.Dsh.Infrastructure.Options.DshOptions> opt, ILogger<WorkspacesController> logger) : ApiBase(accessor)
+    ConfigService config, FileAccessService files, StoragePaths paths, Microsoft.Extensions.Options.IOptions<Teager.Dsh.Infrastructure.Options.DshOptions> opt, DockerSandbox sandbox) : ApiBase(accessor)
 {
     /// <summary>Workspace 列表视图。</summary>
     /// <param name="v">带访问结果的 Workspace。</param>
@@ -107,7 +107,7 @@ public class WorkspacesController(ActorAccessor accessor, PermissionEngine engin
         var mounts = await db.WorkspaceSharedSpaceMounts.CountAsync(m => m.WorkspaceId == id);
         var rt = await db.Runtimes.AsNoTracking().FirstOrDefaultAsync(r => r.PoolId == ws.PoolId);
         var pool = await db.Pools.AsNoTracking().FirstAsync(p => p.Id == ws.PoolId);
-        return new { View = view, Sessions = sessions, Snapshots = snaps, Mounts = mounts, Policy = eff, Runtime = rt == null ? null : new { Status = rt.Status.ToString(), rt.Provider }, pool.RuntimeProvider, TerminalAllowed = eff.AllowTerminal };
+        return new { View = view, Sessions = sessions, Snapshots = snaps, Mounts = mounts, Policy = Me.IsPlatformAdmin ? (object)eff : new { eff.AllowTerminal, eff.AllowNetwork, eff.SandboxMode, eff.MaxStorageMbPerWorkspace, eff.MaxRunMinutes, eff.MaxConcurrentRuns }, Runtime = rt == null ? null : new { Status = rt.Status.ToString(), rt.Provider }, pool.RuntimeProvider, SandboxEnabled = opt.Value.Sandbox.Enabled, TerminalAllowed = eff.AllowTerminal && opt.Value.Sandbox.Enabled };
     }
 
     /// <summary>更新 Workspace。</summary>
@@ -230,9 +230,11 @@ public class WorkspacesController(ActorAccessor accessor, PermissionEngine engin
         object? space = null;
         if (sharedSpaceId != null)
         {
+            Me.RequireScope(Scopes.ShareRead);
             var s = await db.SharedSpaces.AsNoTracking().FirstOrDefaultAsync(x => x.Id == sharedSpaceId) ?? throw ApiException.NotFound("共享空间不存在");
             var mount = await db.WorkspaceSharedSpaceMounts.AsNoTracking().FirstOrDefaultAsync(m => m.WorkspaceId == id && m.SharedSpaceId == sharedSpaceId);
             var a = await engine.GetWorkspaceSpaceAccessAsync(Me, ws, wa, s, mount);
+            if (a.Permission == null) throw ApiException.NotFound("共享空间不存在或无权访问");
             space = new { s.Id, s.Name, Permission = a.Permission?.ToString(), a.Source, ViaPool = a.ViaPoolId == null ? null : graph.NameOf(a.ViaPoolId), a.Path, a.Notes, Mounted = mount != null && mount.Enabled };
         }
         return new { Workspace = new { ws.Id, ws.Name, Pool = graph.NameOf(ws.PoolId) }, Access = new { Role = wa.Role?.ToString(), wa.Denied, wa.Source, ViaPool = wa.ViaPoolId == null ? null : graph.NameOf(wa.ViaPoolId), wa.Path }, SharedSpace = space };
@@ -243,7 +245,8 @@ public class WorkspacesController(ActorAccessor accessor, PermissionEngine engin
     public async Task<object> EffectiveConfig(string id)
     {
         var (ws, _) = await engine.RequireWorkspaceAsync(Me, id, null);
-        return await config.ResolveAsync(ws.PoolId, ws.Id);
+        var items = await config.ResolveAsync(ws.PoolId, ws.Id);
+        return Me.IsPlatformAdmin && Me.Via == "web" ? (object)items : items.Select(c => new { Kind = c.Kind.ToString(), c.Key, c.DisplayName, c.Enabled, c.IsDefault });
     }
 
     // ─────────── 快照 ───────────
@@ -257,7 +260,7 @@ public class WorkspacesController(ActorAccessor accessor, PermissionEngine engin
     }
 
     /// <summary>创建快照。</summary>
-    [HttpPost("workspaces/{id}/snapshots"), Scope(Scopes.WorkspaceWrite)]
+    [HttpPost("workspaces/{id}/snapshots"), Scope(Scopes.FilesWrite)]
     public async Task<object> CreateSnapshot(string id, SnapshotRequest req)
     {
         var s = await workspaces.CreateSnapshotAsync(Me, id, req.Name, req.Description);
@@ -267,7 +270,7 @@ public class WorkspacesController(ActorAccessor accessor, PermissionEngine engin
     }
 
     /// <summary>从快照恢复（覆盖私有文件）。</summary>
-    [HttpPost("workspaces/{id}/snapshots/{snapshotId}/restore"), Scope(Scopes.WorkspaceManage)]
+    [HttpPost("workspaces/{id}/snapshots/{snapshotId}/restore"), Scope(Scopes.FilesWrite)]
     public async Task<IActionResult> RestoreSnapshot(string id, string snapshotId)
     {
         await workspaces.RestoreSnapshotAsync(Me, id, snapshotId);
@@ -277,7 +280,7 @@ public class WorkspacesController(ActorAccessor accessor, PermissionEngine engin
     }
 
     /// <summary>删除快照。</summary>
-    [HttpDelete("workspaces/{id}/snapshots/{snapshotId}"), Scope(Scopes.WorkspaceManage)]
+    [HttpDelete("workspaces/{id}/snapshots/{snapshotId}"), Scope(Scopes.FilesWrite)]
     public async Task<IActionResult> DeleteSnapshot(string id, string snapshotId)
     {
         await workspaces.DeleteSnapshotAsync(Me, id, snapshotId);
@@ -321,7 +324,7 @@ public class WorkspacesController(ActorAccessor accessor, PermissionEngine engin
     {
         var a = await FileScope(id, area, true);
         var bytes = Encoding.UTF8.GetBytes(req.Content ?? "");
-        await files.EnsureQuotaAsync(a, bytes.Length);
+        await files.EnsureQuotaAsync(a, bytes.Length, req.Path);
         files.VersionBefore(a, req.Path);
         await FileStore.WriteAsync(a.Root, req.Path, new MemoryStream(bytes), MaxUploadBytes);
         await files.RecordAsync(Me, a, "write", req.Path);
@@ -340,7 +343,7 @@ public class WorkspacesController(ActorAccessor accessor, PermissionEngine engin
             if (string.IsNullOrEmpty(name)) continue;
             var rel = FileStore.Normalize(path);
             rel = rel.Length == 0 ? name : rel + "/" + name;
-            await files.EnsureQuotaAsync(a, f.Length);
+            await files.EnsureQuotaAsync(a, f.Length, rel);
             files.VersionBefore(a, rel);
             await using var s = f.OpenReadStream();
             await FileStore.WriteAsync(a.Root, rel, s, MaxUploadBytes);
@@ -355,6 +358,7 @@ public class WorkspacesController(ActorAccessor accessor, PermissionEngine engin
     public async Task<IActionResult> Mkdir(string id, [FromQuery] string? area, PathRequest req)
     {
         var a = await FileScope(id, area, true);
+        await files.EnsureQuotaAsync(a, 0, req.Path);
         FileStore.Mkdir(a.Root, req.Path);
         await files.RecordAsync(Me, a, "mkdir", req.Path);
         return NoContent();
@@ -423,7 +427,7 @@ public class WorkspacesController(ActorAccessor accessor, PermissionEngine engin
     /// <param name="write">是否写入。</param>
     private async Task<FileArea> FileScope(string id, string? area, bool write)
     {
-        if (area != null && area.StartsWith("shared/")) Me.RequireScope(write ? Scopes.ShareWrite : Scopes.ShareRead);
+        if (area != null && area.Trim().Trim('/').StartsWith("shared/", StringComparison.Ordinal)) Me.RequireScope(write ? Scopes.ShareWrite : Scopes.ShareRead);
         return await files.ResolveWorkspaceAreaAsync(Me, id, area, write);
     }
 
@@ -440,60 +444,60 @@ public class WorkspacesController(ActorAccessor accessor, PermissionEngine engin
     public async Task Terminal(string id)
     {
         if (!HttpContext.WebSockets.IsWebSocketRequest) throw ApiException.BadRequest("需要 WebSocket 连接");
-        var (ws, wa) = await engine.RequireWorkspaceAsync(Me, id, WorkspaceRole.Member);
-        var eff = await policy.GetEffectiveAsync(ws.PoolId);
-        if (!eff.AllowTerminal) throw ApiException.Forbidden("终端已被平台或 Pool 策略禁用");
-        // 防跨站 WebSocket 劫持：Origin 必须与当前 Host 一致
+        await engine.RequireWorkspaceAsync(Me, id, WorkspaceRole.Member);
         var origin = Request.Headers.Origin.ToString();
-        if (!string.IsNullOrEmpty(origin))
-        {
-            var sameHost = Uri.TryCreate(origin, UriKind.Absolute, out var ou) && string.Equals(ou.Authority, Request.Host.Value, StringComparison.OrdinalIgnoreCase);
-            if (!sameHost && !opt.Value.Platform.CorsOrigins.Contains(origin.TrimEnd('/'), StringComparer.OrdinalIgnoreCase)) throw ApiException.Forbidden("非法的来源");
-        }
-
-        var pool = await db.Pools.AsNoTracking().FirstAsync(p => p.Id == ws.PoolId);
-        var mounts = await materializer.EnsureLayoutAsync(Me, ws, wa);
-        var before = mounts.ToDictionary(m => m.MountName, m => FileStore.Manifest(m.Directory));
-        var env = ProcessUtil.BuildEnv(opt.Value.Runtime.EnvPassthrough, new Dictionary<string, string> { ["HOME"] = paths.WorkspaceRoot(id), ["USERPROFILE"] = paths.WorkspaceRoot(id) });
-        await audit.LogAsync(Me, "terminal.open", "Workspace", id, ws.PoolId, id, "打开终端");
-
+        if (Me.Via == "web" && string.IsNullOrEmpty(origin)) throw ApiException.Forbidden("浏览器终端必须提供来源");
+        if (!string.IsNullOrEmpty(origin) && (!Uri.TryCreate(origin, UriKind.Absolute, out var uri) || uri.Authority != Request.Host.Value) && !opt.Value.Platform.CorsOrigins.Contains(origin.TrimEnd('/')))
+            throw ApiException.Forbidden("非法的终端来源");
+        var execution = await sandbox.StartAsync(Me, id, ["/bin/bash", "-i"], terminal: true, ct: HttpContext.RequestAborted);
+        await audit.LogAsync(Me, "terminal.open", "Workspace", id);
         using var socket = await HttpContext.WebSockets.AcceptWebSocketAsync();
-        await using var term = await runtime.Provider(pool.RuntimeProvider).OpenTerminalAsync(new TerminalRequest(paths.WorkspaceFiles(id), env));
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(HttpContext.RequestAborted);
-        var pump = Task.Run(async () =>
+        using var process = sandbox.Attach(execution);
+        using var cancel = CancellationTokenSource.CreateLinkedTokenSource(HttpContext.RequestAborted);
+        var output = Task.Run(async () =>
         {
-            try { await foreach (var chunk in term.ReadOutputAsync(cts.Token)) await socket.SendAsync(Encoding.UTF8.GetBytes(chunk), WebSocketMessageType.Text, true, cts.Token); }
-            catch (Exception) { /* 连接关闭 */ }
-            finally { cts.Cancel(); }
+            var buffer = new char[4096];
+            try
+            {
+                while (!cancel.IsCancellationRequested)
+                {
+                    var count = await process.StandardOutput.ReadAsync(buffer, cancel.Token);
+                    if (count == 0) break;
+                    await socket.SendAsync(Encoding.UTF8.GetBytes(buffer, 0, count), WebSocketMessageType.Text, true, cancel.Token);
+                }
+            }
+            catch (Exception) when (cancel.IsCancellationRequested) { }
+            finally { cancel.Cancel(); }
         });
-        var buf = new byte[8192];
+        // Drain Docker diagnostics; they never contain user credentials or job config.
+        var errors = process.StandardError.ReadToEndAsync(cancel.Token);
+        var incoming = new byte[16384];
         try
         {
-            while (!cts.IsCancellationRequested && socket.State == WebSocketState.Open)
+            while (!cancel.IsCancellationRequested && socket.State == WebSocketState.Open)
             {
-                var r = await socket.ReceiveAsync(buf, cts.Token);
-                if (r.MessageType == WebSocketMessageType.Close) break;
-                if (r.MessageType == WebSocketMessageType.Text) await term.WriteAsync(Encoding.UTF8.GetString(buf, 0, r.Count).TrimEnd('\r', '\n'));
+                var frame = await socket.ReceiveAsync(incoming, cancel.Token);
+                if (frame.MessageType == WebSocketMessageType.Close) break;
+                if (!frame.EndOfMessage) throw ApiException.BadRequest("终端输入帧过长");
+                var value = Encoding.UTF8.GetString(incoming, 0, frame.Count);
+                if (value.StartsWith("{\"type\":\"resize\""))
+                {
+                    using var json = System.Text.Json.JsonDocument.Parse(value);
+                    var rows = json.RootElement.GetProperty("rows").GetInt32(); var cols = json.RootElement.GetProperty("cols").GetInt32();
+                    await process.StandardInput.WriteLineAsync(System.Text.Json.JsonSerializer.Serialize(new { type = "resize", rows = Math.Clamp(rows, 1, 200), cols = Math.Clamp(cols, 1, 500) }));
+                }
+                else await process.StandardInput.WriteLineAsync(System.Text.Json.JsonSerializer.Serialize(new { type = "input", data = value }));
+                await process.StandardInput.FlushAsync();
             }
         }
         catch (Exception ex) when (ex is OperationCanceledException or WebSocketException) { }
-        cts.Cancel();
-        try { if (socket.State == WebSocketState.Open) await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "closed", CancellationToken.None); } catch { }
-        await pump.WaitAsync(TimeSpan.FromSeconds(2)).ContinueWith(_ => { });
-
-        // 终端无法按文件粒度限制共享空间读写，退出后对比文件清单，对 RO 挂载的改动记违规审计
-        foreach (var m in mounts)
+        finally
         {
-            try
-            {
-                var after = FileStore.Manifest(m.Directory); var b = before[m.MountName];
-                var changed = after.Where(kv => !b.TryGetValue(kv.Key, out var old) || old != kv.Value).Select(kv => kv.Key).Concat(b.Keys.Except(after.Keys)).ToList();
-                if (changed.Count == 0) continue;
-                await audit.LogAsync(Me, m.Permission == SharePermission.RO ? "sharedspace.ro_violation" : "sharedspace.write", "SharedSpace", m.SharedSpaceId, ws.PoolId, id,
-                    $"终端会话期间共享空间「{m.SpaceName}」发生 {changed.Count} 处变更；示例：{string.Join(", ", changed.Take(5))}", m.Permission == SharePermission.RO ? "denied" : "success");
-            }
-            catch (Exception ex) { logger.LogWarning(ex, "终端变更检测失败"); }
+            cancel.Cancel(); ProcessUtil.KillTree(process);
+            await sandbox.StopAsync(execution.Id);
+            try { await output; await errors; } catch (OperationCanceledException) { }
+            if (socket.State == WebSocketState.Open) await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "closed", CancellationToken.None);
+            await audit.LogAsync(Me, "terminal.close", "Workspace", id);
         }
-        await audit.LogAsync(Me, "terminal.close", "Workspace", id, ws.PoolId, id, "关闭终端");
     }
 }

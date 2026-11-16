@@ -85,14 +85,15 @@ public class RuntimeFlowTests
         var viewer = await env.UserAsync("v"); var stranger = await env.UserAsync("x");
         await env.Get<WorkspaceService>().UpsertMemberAsync(env.Admin, ws.Id, viewer.UserId, WorkspaceRole.Viewer, GrantEffect.Allow);
         await Assert.ThrowsAsync<ApiException>(() => sessions.SendAsync(viewer, s.Id, "hi", null));
-        Assert.NotNull(await sessions.MessagesAsync(viewer, s.Id, 0, 10));
+        var legacy = await Assert.ThrowsAsync<ApiException>(() => sessions.MessagesAsync(viewer, s.Id, 0, 10));
+        Assert.Equal(404, legacy.Status);
         var ex = await Assert.ThrowsAsync<ApiException>(() => sessions.MessagesAsync(stranger, s.Id, 0, 10));
         Assert.Equal(404, ex.Status);
     }
 
-    /// <summary>共享空间：Agent 写 RW 挂载记写审计；写 RO 挂载触发违规审计（方案第 64 节）。</summary>
+    /// <summary>共享空间：RW 变更记录观察审计；RO 写入在发生前被阻止。</summary>
     [Fact]
-    public async Task SharedSpace_Write_Audited_And_RO_Violation_Detected()
+    public async Task SharedSpace_RW_Changes_Observed_And_RO_Write_Prevented()
     {
         await using var env = await TestEnv.CreateAsync();
         var c = await env.PoolAsync("集团"); var a = await env.PoolAsync("编辑部", c);
@@ -100,7 +101,9 @@ public class RuntimeFlowTests
         var c1 = await env.SpaceAsync("集团公共", c, c, SharePermission.RO, true);
         var a1 = await env.SpaceAsync("编辑内部", a, a, SharePermission.RW, false);
         var wsSvc = env.Get<WorkspaceService>();
-        var ws = await wsSvc.CreateAsync(user, a.Id, "w", null);
+        var ws = await wsSvc.CreateAsync(env.Admin, a.Id, "w", null);
+        await env.Get<PersonalWorkspaceService>().AssignAsync(env.Admin, user.UserId, ws.Id);
+        await env.Get<SharedSpaceService>().UpsertGrantAsync(env.Admin, a1.Id, GrantSubjectType.USER, user.UserId, SharePermission.RW, GrantEffect.Allow, false);
         await wsSvc.AddMountAsync(env.Admin, ws.Id, c1.Id, "group", null);
         await wsSvc.AddMountAsync(env.Admin, ws.Id, a1.Id, "editorial", null);
         var sessions = env.Get<SessionService>();
@@ -113,10 +116,11 @@ public class RuntimeFlowTests
         var r2 = await sessions.SendAsync(user, s.Id, "/write shared/group/hack.txt 越权写入", null);
         await WaitRunAsync(env, r2.RunId);
         await using var ctx = await env.Root.GetRequiredService<IDbContextFactory<DshDbContext>>().CreateDbContextAsync();
-        Assert.True(await ctx.AuditLogs.AnyAsync(x => x.Action == "sharedspace.write" && x.ResourceId == a1.Id));
-        var violation = await ctx.AuditLogs.FirstOrDefaultAsync(x => x.Action == "sharedspace.ro_violation" && x.ResourceId == c1.Id);
-        Assert.NotNull(violation); Assert.Equal("denied", violation!.Result);
-        Assert.Contains("hack.txt", violation.Detail);
+        Assert.True(await ctx.AuditLogs.AnyAsync(x => x.Action == "sharedspace.observed-change" && x.ResourceId == a1.Id && x.Result == "observed"));
+        Assert.False(File.Exists(Path.Combine(paths.SharedSpace(c1.Id), "hack.txt")));
+        var events = env.Get<SessionEventStore>().Read(s.Id, s.CreatedAt, 0, r2.RunId);
+        Assert.Contains(events, e => e["type"]?.GetValue<string>() == "tool_result" && e["status"]?.GetValue<string>() == "error");
+
     }
 
     /// <summary>Runtime 生命周期：启动 / 停止 / 重启 / 维护模式拒绝新任务。</summary>

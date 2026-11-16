@@ -45,6 +45,7 @@ public class PoolService(DshDbContext db, PermissionEngine engine, PermissionCac
     /// <returns>新 Pool。</returns>
     public async Task<Pool> CreateAsync(Actor actor, string name, string? description, string? parentId, string? runtimeProvider)
     {
+        actor.RequirePlatformAdmin();
         name = RequireName(name);
         int depth = 1; string? inheritedProvider = null;
         if (parentId != null)
@@ -84,7 +85,14 @@ public class PoolService(DshDbContext db, PermissionEngine engine, PermissionCac
     /// <returns>更新后的 Pool。</returns>
     public async Task<Pool> UpdateAsync(Actor actor, string id, string? name, string? description, string? runtimeProvider, bool? inheritConfig)
     {
-        await engine.RequirePoolManageAsync(actor, id);
+        if (!actor.IsPlatformAdmin)
+        {
+            await engine.RequirePoolViewAsync(actor, id);
+            if (actor.Via != "web" || runtimeProvider != null || inheritConfig != null
+                || !await db.PoolMembers.AnyAsync(m => m.PoolId == id && m.UserId == actor.UserId && m.CanEditDetails))
+                throw ApiException.Forbidden("仅管理员指派的编辑者可修改 Pool 名称和描述");
+        }
+        else await engine.RequirePoolManageAsync(actor, id);
         var pool = await GetActiveAsync(id);
         if (name != null)
         {

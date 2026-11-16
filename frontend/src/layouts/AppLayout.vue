@@ -14,7 +14,13 @@ const router = useRouter()
 const auth = useAuthStore()
 
 /** 侧边导航：每一项使用各自模块的主题色（图标色块 + 选中底色）。 */
-const groups = computed(() => [
+const groups = computed(() => !auth.isAdmin ? [{ title: '工作', items: [
+  { key: 'home', path: auth.landingPath, label: '我的工作台', icon: HomeOutlined, mod: 'chat' },
+  { key: 'accessible-pools', path: '/accessible-pools', label: '可访问 Pool', icon: ApartmentOutlined, mod: 'pool' },
+  { key: 'spaces', path: '/shared-spaces', label: '授权共享资源', icon: FolderOpenOutlined, mod: 'space' },
+  { key: 'tokens', path: '/tokens', label: 'API 接入', icon: KeyOutlined, mod: 'token' },
+  { key: 'profile', path: '/profile', label: '个人设置', icon: UserOutlined, mod: 'admin' }
+] }] : [
   { title: '工作', items: [
     { key: 'home', path: '/app', label: '我的工作台', icon: HomeOutlined, mod: 'pool' },
     { key: 'pools', path: '/pools', label: 'Pool 管理', icon: ApartmentOutlined, mod: 'pool' },
@@ -38,6 +44,7 @@ const groups = computed(() => [
 const activeKey = computed(() => {
   const n = String(route.name || '')
   if (n === 'pool') return 'pools'
+  if (!auth.isAdmin && n.startsWith('workbench')) return 'home'
   if (n === 'workspace' || n === 'workbench' || n === 'workbench-session') return 'workspaces'
   if (n === 'space') return 'spaces'
   return n

@@ -118,26 +118,28 @@ public class PoolAndConfigTests
         var eff = await cfg.ResolveAsync(a.Id, null);
         Assert.Equal(2, eff.Count(e => e.Kind == ConfigKind.Model && e.Enabled));
         // Pool A 管理员停用 gpt-x（收紧）
-        await cfg.UpsertAsync(pa, ConfigKind.Model, ConfigScope.Pool, a.Id, new ConfigUpsert("gpt-x", null, false, null, null));
+        await Assert.ThrowsAsync<ApiException>(() => cfg.UpsertAsync(pa, ConfigKind.Model, ConfigScope.Pool, a.Id, new ConfigUpsert("gpt-x", null, false, null, null)));
+        await cfg.UpsertAsync(env.Admin, ConfigKind.Model, ConfigScope.Pool, a.Id, new ConfigUpsert("gpt-x", null, false, null, null));
         eff = await cfg.ResolveAsync(a.Id, null);
         Assert.False(eff.First(e => e.Key == "gpt-x").Enabled);
         Assert.Equal("A", eff.First(e => e.Key == "gpt-x").DisabledAt);
         // 父级 C 的有效配置不受影响
         Assert.True((await cfg.ResolveAsync(c.Id, null)).First(e => e.Key == "gpt-x").Enabled);
         // Workspace 层不能重新启用被 Pool A 停用的项
-        var ws = await env.Get<WorkspaceService>().CreateAsync(pa, a.Id, "w", null);
+        var ws = await env.Get<WorkspaceService>().CreateAsync(env.Admin, a.Id, "w", null);
         await Assert.ThrowsAsync<ApiException>(() => cfg.UpsertAsync(pa, ConfigKind.Model, ConfigScope.Workspace, ws.Id, new ConfigUpsert("gpt-x", null, true, null, null)));
         // 非管理员不能新增全新模型 / MCP（扩大能力面），Skill 默认允许
         await Assert.ThrowsAsync<ApiException>(() => cfg.UpsertAsync(pa, ConfigKind.Model, ConfigScope.Pool, a.Id, new ConfigUpsert("my-model", null, true, "{\"provider\":\"x\"}", null)));
         await Assert.ThrowsAsync<ApiException>(() => cfg.UpsertAsync(pa, ConfigKind.Mcp, ConfigScope.Pool, a.Id, new ConfigUpsert("evil", null, true, "{\"transport\":\"stdio\",\"command\":\"rm\"}", null)));
-        await cfg.UpsertAsync(pa, ConfigKind.Skill, ConfigScope.Pool, a.Id, new ConfigUpsert("weekly-report", "周报", true, null, "# 周报写作规范"));
+        await Assert.ThrowsAsync<ApiException>(() => cfg.UpsertAsync(pa, ConfigKind.Skill, ConfigScope.Pool, a.Id, new ConfigUpsert("weekly-report", "周报", true, null, "# 周报写作规范")));
+        await cfg.UpsertAsync(env.Admin, ConfigKind.Skill, ConfigScope.Pool, a.Id, new ConfigUpsert("weekly-report", "周报", true, null, "# 周报写作规范"));
         Assert.Contains((await cfg.ResolveAsync(a.Id, ws.Id)), e => e.Kind == ConfigKind.Skill && e.Key == "weekly-report" && e.Enabled);
         // 平台管理员显式授权后，Pool 管理员可新增 MCP
         env.Db.ChangeTracker.Clear();
         var pool = await env.Db.Pools.FirstAsync(p => p.Id == a.Id);
         pool.PolicyJson = System.Text.Json.JsonSerializer.Serialize(new PoolPolicy { AllowOwnMcp = true }, PolicyService.Json);
         await env.Db.SaveChangesAsync();
-        await cfg.UpsertAsync(pa, ConfigKind.Mcp, ConfigScope.Pool, a.Id, new ConfigUpsert("docs", null, true, "{\"transport\":\"streamable-http\",\"url\":\"http://docs/mcp\"}", null));
+        await Assert.ThrowsAsync<ApiException>(() => cfg.UpsertAsync(pa, ConfigKind.Mcp, ConfigScope.Pool, a.Id, new ConfigUpsert("docs", null, true, "{\"transport\":\"streamable-http\",\"url\":\"http://docs/mcp\"}", null)));
         // 模型默认选择：C 声明 deepseek-flash 为默认
         Assert.True((await cfg.ResolveAsync(a.Id, null)).First(e => e.Key == "deepseek-flash").IsDefault);
     }

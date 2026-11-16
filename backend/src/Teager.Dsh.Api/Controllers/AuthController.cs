@@ -23,7 +23,7 @@ public record LoginRequest(string Username, string Password);
 public record ChangePasswordRequest(string OldPassword, string NewPassword);
 
 /// <summary>认证：用户名密码登录，登录态为服务端 Session + HttpOnly Cookie；退出、当前用户、改密。</summary>
-public class AuthController(ActorAccessor accessor, AuthService auth, IOptions<DshOptions> opt, DshDbContext db, PermissionEngine engine, AuditService audit) : ApiBase(accessor)
+public class AuthController(ActorAccessor accessor, AuthService auth, IOptions<DshOptions> opt, DshDbContext db, PermissionEngine engine, AuditService audit, PersonalWorkspaceService personal) : ApiBase(accessor)
 {
     /// <summary>登录（按 IP 限流）。</summary>
     [HttpPost("auth/login"), AllowAnonymous, EnableRateLimiting("login")]
@@ -67,13 +67,22 @@ public class AuthController(ActorAccessor accessor, AuthService auth, IOptions<D
     /// <param name="via">访问方式（web / token）。</param>
     private async Task<object> MeView(string userId, string via)
     {
+        if (via == "web") await personal.EnsureAsync(userId);
         var u = await db.Users.AsNoTracking().FirstAsync(x => x.Id == userId);
         var graph = await engine.GetGraphAsync();
         var direct = await engine.GetDirectRolesAsync(userId);
         var effective = await engine.GetEffectivePoolIdsAsync(userId);
+        if (via == "token")
+        {
+            var visible = await engine.GetAccessiblePoolsAsync(Me);
+            direct = direct.Where(p => visible.ContainsKey(p.Key)).ToDictionary(p => p.Key, p => p.Value);
+            effective.IntersectWith(visible.Keys);
+        }
         return new
         {
             u.Id, u.Username, u.DisplayName, u.Email, Role = u.Role.ToString(), u.IsServiceAccount, u.LastLoginAt,
+            u.DefaultWorkspaceId,
+            LandingPath = u.Role == PlatformRole.Admin ? "/app" : u.DefaultWorkspaceId == null ? "/app" : "/w/" + u.DefaultWorkspaceId,
             Via = via,
             DirectPools = direct.Where(kv => graph.Nodes.ContainsKey(kv.Key)).Select(kv => new { Id = kv.Key, Name = graph.NameOf(kv.Key), Role = kv.Value.ToString() }),
             EffectivePools = effective.Select(p => new { Id = p, Name = graph.NameOf(p), Direct = direct.ContainsKey(p) })

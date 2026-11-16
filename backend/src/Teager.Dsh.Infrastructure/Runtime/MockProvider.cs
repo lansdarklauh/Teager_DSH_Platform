@@ -2,6 +2,10 @@ using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using System.Text.Json.Nodes;
 using Teager.Dsh.Infrastructure.Storage;
+using Teager.Dsh.Infrastructure.Common;
+using Teager.Dsh.Domain;
+using Microsoft.Extensions.DependencyInjection;
+using Teager.Dsh.Infrastructure.Services;
 
 namespace Teager.Dsh.Infrastructure.Runtime;
 
@@ -10,7 +14,7 @@ namespace Teager.Dsh.Infrastructure.Runtime;
 /// 事件格式与 DSH headless --json 保持一致。支持的指令：
 /// <c>/sleep N</c> 等待 N 秒（测试取消与并发）；<c>/fail</c> 模拟失败；<c>/write 相对路径 内容</c> 写入 Workspace 内文件（测试共享空间读写与 RO 检测）。
 /// </summary>
-public class MockProvider : IRuntimeProvider
+public class MockProvider(DockerSandbox sandbox, IServiceScopeFactory scopes) : IRuntimeProvider
 {
     private readonly ConcurrentDictionary<string, int> _active = new();
 
@@ -75,11 +79,26 @@ public class MockProvider : IRuntimeProvider
                 string status, result;
                 try
                 {
-                    var full = Path.GetFullPath(Path.Combine(req.WorkspaceRoot, rel));
-                    var rootFull = Path.GetFullPath(req.WorkspaceRoot);
-                    if (!full.StartsWith(rootFull, StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException("路径超出 Workspace");
-                    Directory.CreateDirectory(Path.GetDirectoryName(full)!);
-                    await File.WriteAllTextAsync(full, text, ct);
+                    await using var lease = await sandbox.AcquireFileLeaseAsync(ct);
+                    if (req.Env.GetValueOrDefault("DSH_PERMISSION_MODE") == "read-only") throw ApiException.Forbidden("Agent 文件写入被只读策略禁止");
+                    var normalized = rel.Replace('\\', '/');
+                    string root, path;
+                    if (normalized.StartsWith("files/", StringComparison.Ordinal)) { root = Path.Combine(req.WorkspaceRoot, "files"); path = normalized[6..]; }
+                    else if (normalized.StartsWith("shared/", StringComparison.Ordinal))
+                    {
+                        var segments = normalized.Split('/', 3);
+                        var mount = req.Mounts.FirstOrDefault(m => m.MountName == segments.ElementAtOrDefault(1)) ?? throw ApiException.Forbidden("共享空间未授权");
+                        if (mount.Permission < SharePermission.RW) throw ApiException.Forbidden("共享空间只读");
+                        root = mount.Directory; path = segments.ElementAtOrDefault(2) ?? "";
+                    }
+                    else throw ApiException.Forbidden("只能写入个人 files 或已授权的共享文件区");
+                    await using var scope = scopes.CreateAsyncScope();
+                    var fileAccess = scope.ServiceProvider.GetRequiredService<FileAccessService>();
+                    var areaName = normalized.StartsWith("files/", StringComparison.Ordinal) ? "files" : "shared/" + normalized.Split('/')[1];
+                    var area = await fileAccess.ResolveWorkspaceAreaAsync(req.ExecutionActor!, req.WorkspaceId, areaName, true);
+                    await fileAccess.EnsureQuotaAsync(area, System.Text.Encoding.UTF8.GetByteCount(text), path);
+                    await using var content = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(text));
+                    await FileStore.WriteAsync(root, path, content, 1024 * 1024);
                     status = "ok"; result = $"已写入 {rel}（{text.Length} 字符）";
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException) { status = "error"; result = "写入失败：" + ex.Message; }

@@ -20,6 +20,7 @@ public class SharedSpaceService(DshDbContext db, PermissionEngine engine, Permis
     /// <returns>共享空间。</returns>
     public async Task<SharedSpace> CreateAsync(Actor actor, string name, string? description, string? ownerPoolId, int quotaMb, string? mountName)
     {
+        actor.RequirePlatformAdmin();
         name = name?.Trim() ?? "";
         if (name.Length == 0 || name.Length > 100) throw ApiException.BadRequest("名称不能为空且不超过 100 个字符");
         if (ownerPoolId != null) await engine.RequirePoolManageAsync(actor, ownerPoolId);
@@ -80,6 +81,20 @@ public class SharedSpaceService(DshDbContext db, PermissionEngine engine, Permis
         pc.Invalidate();
     }
 
+    /// <summary>恢复已归档的共享空间。</summary>
+    /// <param name="actor">操作者。</param>
+    /// <param name="id">共享空间 ID。</param>
+    public async Task RestoreAsync(Actor actor, string id)
+    {
+        actor.RequirePlatformAdmin();
+        var space = await db.SharedSpaces.FirstOrDefaultAsync(s => s.Id == id && s.Status == SharedSpaceStatus.Archived) ?? throw ApiException.NotFound("归档的共享空间不存在");
+        await RequireAsync(actor, id, SharePermission.MANAGE);
+        space.Status = SharedSpaceStatus.Active;
+        space.UpdatedAt = DateTime.Now;
+        await db.SaveChangesAsync();
+        pc.Invalidate();
+    }
+
     /// <summary>加载共享空间并要求最小权限；无任何访问权返回 404，权限不足 403。</summary>
     /// <param name="actor">操作者。</param>
     /// <param name="id">共享空间 ID。</param>
@@ -87,6 +102,7 @@ public class SharedSpaceService(DshDbContext db, PermissionEngine engine, Permis
     /// <returns>共享空间与访问结论。</returns>
     public async Task<(SharedSpace Space, SpaceAccess Access)> RequireAsync(Actor actor, string id, SharePermission min)
     {
+        if (min == SharePermission.MANAGE) actor.RequirePlatformAdmin();
         var space = await db.SharedSpaces.FirstOrDefaultAsync(s => s.Id == id) ?? throw ApiException.NotFound("共享空间不存在或无权访问");
         var access = await engine.GetUserSpaceAccessAsync(actor, space);
         if (access.Permission == null) throw ApiException.NotFound("共享空间不存在或无权访问");

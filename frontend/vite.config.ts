@@ -23,7 +23,7 @@ export default defineConfig(({ mode }) => {
       chunkSizeWarningLimit: 1500,
       rollupOptions: {
         output: {
-          manualChunks: { antd: ['ant-design-vue', '@ant-design/icons-vue'], vendor: ['vue', 'vue-router', 'pinia', 'axios', 'dayjs'] }
+          manualChunks(id) { if (id.includes('node_modules')) return 'vendor' }
         }
       }
     }

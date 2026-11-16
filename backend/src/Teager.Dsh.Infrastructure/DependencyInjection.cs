@@ -34,9 +34,15 @@ public static class DependencyInjection
         services.AddScoped<ActorAccessor>().AddScoped<PermissionEngine>().AddScoped<AuditService>().AddScoped<PolicyService>();
         services.AddScoped<PoolService>().AddScoped<WorkspaceService>().AddScoped<SharedSpaceService>().AddScoped<FileAccessService>();
         services.AddScoped<ConfigAccess>().AddScoped<ConfigService>().AddScoped<SecretService>();
+        services.AddScoped<ModelCredentialMigration>();
         services.AddScoped<RuntimeManager>().AddScoped<RuntimeMaterializer>().AddScoped<SessionService>().AddScoped<WorkspaceListHelper>();
         services.AddScoped<AuthService>().AddScoped<UserService>().AddScoped<TokenService>().AddScoped<UsageService>();
+        services.AddScoped<PersonalWorkspaceService>();
+        services.AddSingleton<DockerSandbox>();
+        services.AddHostedService(sp => sp.GetRequiredService<DockerSandbox>());
         services.AddHostedService<MaintenanceService>();
+        services.AddSingleton<PlatformLease>();
+        services.AddHostedService(sp => sp.GetRequiredService<PlatformLease>());
         return services;
     }
 }
